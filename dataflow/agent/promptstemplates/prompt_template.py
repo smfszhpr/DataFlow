@@ -195,6 +195,62 @@ class PromptsTemplateGenerator:
             except Exception as e:
                 raise ValueError(f"JSON template string could not be parsed into a dict: {e}")
         self.json_form_templates[task_name] = json_template
+    
+    def get_xml_form_selection_prompt(self, query: str, forms_list: str) -> str:
+        """获取XML表单类型选择提示词"""
+        template = """你是一个智能助手，负责根据用户的查询内容确定需要什么类型的表单。
+
+用户查询：{query}
+
+可用的表单类型：
+{forms_list}
+
+请仔细分析用户的查询内容，并返回最匹配的表单类型（只返回类型名称，不要添加任何解释）。
+
+如果用户想要：
+- 创建新的算子或组件 -> create_operator
+- 优化现有算子性能 -> optimize_operator  
+- 获取pipeline推荐 -> recommend_pipeline
+- 构建知识库 -> knowledge_base
+
+表单类型："""
+        return self._safe_format(template, query=query, forms_list=forms_list)
+    
+    def get_xml_form_conversation_prompt(self, template_name: str, conversation_context: str, 
+                                       query: str, form_type: str, required_fields: list,
+                                       optional_fields: list, conversation_guide: str) -> str:
+        """获取XML表单对话提示词"""
+        template = """你是DataFlow平台的{template_name}专家助手，负责通过对话收集用户需求并最终生成XML配置。
+
+{conversation_context}
+
+当前用户查询：{query}
+
+你需要完成以下任务：
+1. 根据用户的{form_type}需求，进行引导性对话
+2. 收集必要信息：{required_fields}
+3. 收集可选信息：{optional_fields}
+4. 当信息收集完整时，生成规范的XML表单
+
+对话指南：
+{conversation_guide}
+
+请注意：
+- 如果信息不够完整，继续询问缺失的关键信息
+- 当所有必要信息收集完成后，生成完整的XML表单
+- XML表单必须包含在```xml和```之间
+- 保持对话自然友好，逐步引导用户提供信息
+
+响应："""
+        return self._safe_format(template,
+            template_name=template_name,
+            conversation_context=conversation_context,
+            query=query,
+            form_type=form_type,
+            required_fields=", ".join(required_fields),
+            optional_fields=", ".join(optional_fields),
+            conversation_guide=conversation_guide
+        )
 
 
 # if __name__ == "__main__":

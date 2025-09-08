@@ -1,0 +1,59 @@
+# Event Engine 配置文件
+# API 配置
+api:
+  # LLM API 配置
+  llm:
+    api_key: "sk-h0ilpl24SJN8oNYukuKkQxsl13Xn6uuzBeKyMYdSPEb3TdYO"  # 请填写您的API密钥
+    api_url: "https://jeniya.top/v1/chat/completions"  # API地址
+    model: "gpt-4.1"  # 模型名称
+    timeout: 60  # 超时时间（秒）
+    max_retries: 3  # 最大重试次数
+    temperature: 0.7  # 生成温度
+    max_tokens: 2000  # 最大tokens
+
+# Event Engine 配置
+engine:
+  # 队列配置
+  queue:
+    max_size: 1000  # 最大队列大小
+    check_interval: 0.1  # 检查间隔（秒）
+    
+  # 重试配置  
+  retry:
+    max_attempts: 3  # 最大重试次数
+    base_delay: 1.0  # 基础延迟（秒）
+    max_delay: 60.0  # 最大延迟（秒）
+    
+  # 并发配置
+  concurrency:
+    max_workers: 5  # 最大并发处理数
+    timeout: 300  # 任务超时时间（秒）
+
+# Former Agent 配置
+former:
+  # 对话配置
+  conversation:
+    max_history: 20  # 最大对话历史条数
+    session_timeout: 3600  # 会话超时时间（秒）
+    
+  # 表单检测配置
+  form_detection:
+    use_llm: true  # 是否使用LLM进行表单类型检测
+    fallback_to_keywords: true  # 是否在LLM失败时回退到关键字匹配
+    
+  # XML生成配置
+  xml_generation:
+    auto_generate: true  # 是否自动生成XML
+    validate_on_generate: true  # 生成时是否验证XML格式
+
+# 日志配置
+logging:
+  level: "INFO"  # 日志级别：DEBUG, INFO, WARNING, ERROR
+  enable_file_logging: false  # 是否启用文件日志
+  log_file_path: "./logs/eventengine.log"  # 日志文件路径
+
+# 开发配置
+development:
+  debug_mode: false  # 调试模式
+  mock_llm_responses: false  # 是否模拟LLM响应（测试用）
+  enable_metrics: true  # 是否启用性能指标收集

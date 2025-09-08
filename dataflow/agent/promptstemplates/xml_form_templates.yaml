@@ -1,0 +1,115 @@
+# 表单模板配置文件
+# 支持多种类型的表单，根据用户需求自动选择合适的表单
+
+templates:
+  
+  # 创建算子表单
+  create_operator:
+    name: "创建算子"
+    description: "根据用户需求创建新的数据处理算子"
+    conversation_guide: |
+      首先了解用户想要创建什么类型的算子，然后询问：
+      1. 具体的处理需求是什么？
+      2. 输入数据的格式和特点？
+      3. 期望的输出格式？
+      4. 是否有具体的输入输出示例？
+
+    xml_schema:
+      required_fields:
+        - user_requirements  # 用户需求描述
+        - dataset       # 数据集路径
+        - output_format      # 输出格式
+      optional_fields:
+        - example_input      # 输入示例
+        - example_output     # 输出示例
+    
+  # 优化算子表单  
+  optimize_operator:
+    name: "优化算子"
+    description: "对现有算子进行性能优化或功能增强"
+    conversation_guide: |
+      了解现有算子的情况和优化目标：
+      1. 当前算子的代码和功能是什么？
+      2. 遇到了什么性能问题或限制？
+      3. 希望在哪些方面进行优化？
+      4. 有没有具体的性能指标要求？
+      
+    xml_schema:
+      required_fields:
+        - user_requirements  # 优化需求
+        - dataset       # 数据集
+        - existing_code      # 现有代码
+        - optimization_goal  # 优化目标
+      optional_fields:
+        - example_input      # 输入示例
+        - example_output     # 输出示例
+
+  # 推荐pipeline表单
+  recommend_pipeline:
+    name: "推荐Pipeline"
+    description: "根据数据治理需求推荐合适的pipeline组合"
+    conversation_guide: |
+      了解数据治理的具体需求：
+      1. 数据来源和格式是什么？
+      2. 数据存在哪些质量问题？
+      3. 最终想要达到什么样的数据治理效果？
+      4. 对处理性能有什么要求？
+      
+    xml_schema:
+      required_fields:
+        - user_requirements  # 数据治理需求
+        - dataset_path      # 数据集路径
+        - target_goal       # 治理目标
+      optional_fields:
+        - data_quality_issues # 数据质量问题
+        - processing_constraints # 处理约束
+        - performance_requirements # 性能要求
+
+  # 知识库构建表单
+  knowledge_base:
+    name: "知识库构建"
+    description: "构建知识库数据清洗与入库pipeline"
+    conversation_guide: |
+      了解知识库构建的需求：
+      1. 要处理什么类型的文档？
+      2. 文档存放在哪里？
+      3. 知识库要存储到哪个数据库？
+      4. 对文档处理有什么特殊要求？
+      
+    xml_schema:
+      required_fields:
+        - user_requirements  # 用户需求
+        - document_types    # 文档类型
+        - target_database   # 目标数据库
+      optional_fields:
+        - cleaning_rules    # 清洗规则
+        - chunking_strategy # 分块策略
+        - embedding_model   # 向量化模型
+
+# 默认配置
+default_config:
+  execution:
+    timeout: 3600
+    max_debug_round: 3
+    stream_output: true
+    use_local_model: false
+  
+  api:
+    model: "deepseek-v3"
+    backend_url: "http://localhost:7862/api"
+    
+  pipeline:
+    execute_the_pipeline: true
+    execute_the_operator: true
+    language: "zh"
+
+# 表单选择规则
+selection_rules:
+  # 基于关键词匹配
+  keyword_matching:
+    threshold: 0.6
+    
+  # 基于意图分类
+  intent_classification:
+    enabled: true
+    fallback_to_recommend: true  # 如果无法确定意图，默认使用推荐pipeline
