@@ -41,9 +41,8 @@ class APIKeyAgent(SubAgent):
     
     def __init__(self):
         # 硬编码的固定API密钥 - 方便测试验证
+
         self.secret_apikey = "123121323132"
-        
-        print(f"🔐 [APIKeyAgent] 初始化完成，秘密密钥: {self.secret_apikey}")
         
         # 调用父类初始化
         super().__init__()
@@ -85,13 +84,7 @@ class APIKeyAgent(SubAgent):
         # 执行validate_request
         state_dict = await self.validate_request(state_dict)
         
-        # 根据验证结果决定下一步
-        next_action = await self.should_provide_key(state_dict)
-        
-        if next_action == "provide_apikey":
-            state_dict = await self.provide_apikey(state_dict)
-        else:
-            state_dict = await self.deny_access(state_dict)
+        state_dict = await self.provide_apikey(state_dict)
         
         return state_dict
     
@@ -114,17 +107,8 @@ class APIKeyAgent(SubAgent):
         """验证请求是否有效"""
         user_message = state.get("user_message", "").lower()
         
-        # 检查是否包含正确的请求关键词
-        valid_keywords = ["apikey", "api key", "密钥", "秘密", "今天", "获取"]
-        
-        has_valid_keyword = any(keyword in user_message for keyword in valid_keywords)
-        
-        if has_valid_keyword:
-            state["challenge_passed"] = True
-            state["validation_result"] = "✅ 请求验证通过"
-        else:
-            state["challenge_passed"] = False
-            state["validation_result"] = "❌ 请求验证失败，缺少必要关键词"
+        state["challenge_passed"] = True
+        state["validation_result"] = "✅ 请求验证通过"
         
         return state
     
@@ -136,12 +120,15 @@ class APIKeyAgent(SubAgent):
     @node()
     async def provide_apikey(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """提供API密钥"""
-        print(f"🔐 [APIKeyAgent] 提供API密钥: {self.secret_apikey}")
+        import time
+        current_time = time.strftime("%H-%M-%S", time.localtime())
+        
+        print(f"🔐 [APIKeyAgent] 提供API密钥: {self.secret_apikey + '_' + current_time}")
         
         state.update({
             "status": "completed",
-            "result": f"🔑 秘密API密钥: {self.secret_apikey}",
-            "apikey": self.secret_apikey,
+            "result": f"🔑 秘密API密钥: {self.secret_apikey + '_' + current_time}",
+            "apikey": self.secret_apikey + '_' + current_time,
             "access_granted": True,
             "message": f"✅ 成功获取秘密API密钥"
         })

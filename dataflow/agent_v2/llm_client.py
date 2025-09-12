@@ -19,6 +19,11 @@ class LLMClient:
         self.llm_config = get_llm_config()
         self.api_available = bool(self.llm_config.api_key and self.llm_config.api_url)
         
+        # 立即设置环境变量，确保后续调用可以使用
+        if self.api_available:
+            os.environ["DF_API_KEY"] = self.llm_config.api_key
+            logger.info(f"已设置DF_API_KEY环境变量，长度: {len(self.llm_config.api_key)}")
+        
         if not self.api_available:
             logger.warning("LLM API配置不可用，将使用fallback模式")
         
