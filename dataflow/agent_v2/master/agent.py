@@ -401,16 +401,7 @@ class MasterAgent:
                 logger.error(f"通用对话LLM调用失败: {e}")
         
         # LLM不可用时的fallback逻辑
-        response = self._get_fallback_response(user_input, conversation_history)
-        
-
-        finish = LCAgentFinish(
-            return_values={"output": response},
-            log="Fallback响应"
-        )
-
-        state.agent_outcome = finish
-        return state
+        raise Exception("LLM服务不可用，无法处理对话")
     
     async def planner_node(self, state: AgentState) -> AgentState:
         """规划器节点 - 每次只规划下一个单独动作"""
@@ -548,11 +539,7 @@ class MasterAgent:
             
         logger.info("⚠️ 无匹配条件，默认路由到general_conversation")
         return "general_conversation"
-    
-    def _simple_keyword_fallback(self, user_input: str) -> Optional[Dict[str, Any]]:
-        """当LLM不可用时，所有SubAgent都没有意义，直接抛出错误"""
-        raise Exception("LLM服务不可用，无法执行任何工具或SubAgent")
-    
+
     def _build_history_text(self, conversation_history: List[Dict[str, str]], k: int = 8, clip: int = 200) -> str:
         """把最近 k 条历史拼成统一文本；长消息裁剪到 clip 字符。"""
         if not conversation_history:
@@ -568,19 +555,15 @@ class MasterAgent:
             lines.append(f"{role}: {content}")
         return "\n".join(lines)
     
-    def _get_fallback_response(self, user_input: str, conversation_history: List[Dict[str, str]]) -> str:
-        """Fallback响应 - 不做假装回复，直接抛出异常"""
-        raise Exception("LLM服务不可用，无法处理对话")
     
     async def _generate_conversation_response(self, state: AgentState) -> str:
         """基于工具执行结果和对话历史生成智能响应 - 让大模型对所有工具结果进行智能总结"""
         user_input = state.input
         conversation_history = state.conversation_history
         
-        # 构建详细的工具执行结果 - 包含所有执行步骤和具体结果
+        # 构建详细的工具执行结果 - 通用化处理，不硬编码特定字段
         detailed_tool_results = []
-        api_keys_collected = []  # 专门收集API密钥
-        sleep_records = []       # 专门收集睡眠记录
+        tool_output_summary = {}  # 按工具类型汇总输出
         
         for i, (action, result) in enumerate(state.intermediate_steps):
             tool_name = action.tool
@@ -594,15 +577,30 @@ class MasterAgent:
                     "result": result
                 })
                 
-                # 专门收集API密钥
-                if tool_name == "APIKey获取工具" and result.get("access_granted"):
-                    api_key = result.get("apikey", "")
-                    api_keys_collected.append(f"第{step_num}次: {api_key}")
+                # 通用化地收集每个工具的输出
+                if tool_name not in tool_output_summary:
+                    tool_output_summary[tool_name] = []
                 
-                # 专门收集睡眠记录
-                elif tool_name == "sleep_tool" and result.get("success"):
-                    duration = result.get("duration", 0)
-                    sleep_records.append(f"第{step_num}次睡眠: {duration}秒")
+                # 动态提取结果中的重要信息
+                important_fields = []
+                for key, value in result.items():
+                    # 不跳过任何字段，让LLM看到完整的工具返回数据
+                    if isinstance(value, (str, int, float, bool)) and len(str(value)) < 200:
+                        important_fields.append(f"{key}: {value}")
+                
+                # 判断执行状态 - 更智能的状态判断
+                is_success = (
+                    result.get("success") is True or 
+                    result.get("access_granted") is True or
+                    result.get("ok") is True or
+                    result.get("status") == "completed"
+                )
+                
+                tool_output_summary[tool_name].append({
+                    "step": step_num,
+                    "status": "成功" if is_success else "失败",
+                    "details": important_fields
+                })
                     
             else:
                 # 如果不是字典，也要记录
@@ -611,34 +609,34 @@ class MasterAgent:
                     "tool": tool_name,
                     "result": {"raw_output": str(result)}
                 })
+                
+                if tool_name not in tool_output_summary:
+                    tool_output_summary[tool_name] = []
+                tool_output_summary[tool_name].append({
+                    "step": step_num,
+                    "status": "完成",
+                    "details": [f"输出: {str(result)[:50]}"]
+                })
         
         # 如果LLM不可用，使用增强的格式化输出
         if not self.llm.api_available:
-            return self._enhanced_format_results(detailed_tool_results, api_keys_collected, sleep_records, user_input)
+            Exception("LLM服务不可用，无法执行任何工具或SubAgent")
         
         try:
             # 构建更智能的提示词，要求大模型进行深度总结
-            system_prompt = """你是DataFlow智能助手。用户刚刚完成了一系列工具调用，你需要对执行结果进行智能总结和分析。
+            system_prompt = """你是DataFlow智能助手。请基于工具执行结果进行总结。
 
-总结要求：
-1. **必须包含所有具体结果** - 如果有多个API密钥，要全部列出；如果有睡眠间隔，要说明具体时长
-2. **分析执行过程** - 说明调用顺序、间隔控制等
-3. **回答用户关心的问题** - 比如"有什么不同"要具体对比分析
-4. **语言自然友好** - 不要生硬地列举，要像真正的助手一样交流
-5. **突出重点信息** - 把用户最关心的结果放在前面
-
-特别注意：
-- 如果用户问"有什么不同"，要仔细对比每次结果的差异
-- 如果有多个API密钥，必须全部显示，不能遗漏
-- 如果有时间间隔，要说明具体的等待时间和控制效果"""
+要求：
+1. 准确显示所有工具返回的数据，包括具体的API密钥值
+2. 不要编造信息，所有内容都基于执行报告
+3. 用自然的语言总结执行结果"""
 
             # 构建对话历史文本
             history_text = self._build_history_text(conversation_history, k=10, clip=300)
             
             # 构建详细的工具执行报告
             try:
-                execution_report = self._build_detailed_execution_report(detailed_tool_results, api_keys_collected, sleep_records)
-                logger.info(f"📊 执行报告构建成功，长度: {len(execution_report)}")
+                execution_report = self._build_detailed_execution_report(detailed_tool_results, tool_output_summary)
             except Exception as report_error:
                 logger.error(f"构建执行报告失败: {report_error}")
                 execution_report = f"执行报告构建失败: {str(report_error)}"
@@ -652,10 +650,10 @@ class MasterAgent:
 {history_text}
 
 请你作为智能助手，对这次执行结果进行全面、详细的总结。特别要注意：
-1. 如果用户问"有什么不同"，要仔细分析每次结果的具体差异
-2. 所有获取的API密钥都要完整展示，不能遗漏
-3. 如果有间隔控制，要说明具体的时间控制效果
-4. 用自然的语言回答，像真正的助手一样"""
+1. 执行报告中的所有数据都是真实的工具返回结果，必须准确显示
+2.不需要详细说明执行流程，只需总结结果和分析
+3. 用户有权查看所有工具返回的数据，不要隐藏任何信息
+4. 基于报告中的真实数据进行分析，不要编造"""
 
             logger.info(f"🚀 准备调用LLM，user_prompt长度: {len(user_prompt)}")
             
@@ -709,117 +707,60 @@ class MasterAgent:
             logger.error(f"详细错误: {traceback.format_exc()}")
         
         # fallback到增强格式化
-        return self._enhanced_format_results(detailed_tool_results, api_keys_collected, sleep_records, user_input)
-    
-    def _simple_format_results(self, tool_results_summary: List[Dict[str, Any]]) -> str:
-        """简单格式化工具结果（当LLM不可用时）"""
-        for tool_summary in tool_results_summary:
-            tool_name = tool_summary["tool"]
-            result = tool_summary["result"]
-            
-            if tool_name == "APIKey获取工具":
-                if result.get("access_granted"):
-                    api_key = result.get("apikey", "")
-                    return f"🔑 今天的秘密API密钥是: `{api_key}`"
-                else:
-                    return "❌ 无法获取API密钥"
-        
-        return "✅ 操作完成"
-    
-    def _enhanced_format_results(self, detailed_tool_results: List[Dict], api_keys_collected: List[str], sleep_records: List[str], user_input: str) -> str:
-        """增强格式化工具结果（LLM不可用时的fallback）"""
-        if not detailed_tool_results:
-            return "✅ 任务完成，但没有工具执行记录"
-        
-        # 构建详细的执行报告
-        report_lines = ["📋 执行报告："]
-        
-        # 如果有API密钥，优先展示
-        if api_keys_collected:
-            report_lines.append(f"\n🔑 获取到的API密钥（共{len(api_keys_collected)}个）：")
-            for api_key_info in api_keys_collected:
-                report_lines.append(f"  • {api_key_info}")
-        
-        # 如果有睡眠记录，展示间隔控制
-        if sleep_records:
-            report_lines.append(f"\n⏰ 间隔控制记录：")
-            for sleep_info in sleep_records:
-                report_lines.append(f"  • {sleep_info}")
-        
-        # 展示完整执行流程
-        report_lines.append(f"\n📝 完整执行流程（共{len(detailed_tool_results)}步）：")
-        for tool_result in detailed_tool_results:
-            step = tool_result["step"]
-            tool = tool_result["tool"]
-            result = tool_result["result"]
-            
-            if tool == "APIKey获取工具" and result.get("access_granted"):
-                api_key = result.get("apikey", "N/A")
-                report_lines.append(f"  步骤{step}: 获取API密钥 → {api_key}")
-            elif tool == "sleep_tool" and result.get("success"):
-                duration = result.get("duration", 0)
-                report_lines.append(f"  步骤{step}: 睡眠等待 → {duration}秒")
-            else:
-                report_lines.append(f"  步骤{step}: {tool} → 执行完成")
-        
-        # 如果用户问"有什么不同"，尝试简单分析
-        if "不同" in user_input and api_keys_collected:
-            report_lines.append(f"\n🔍 差异分析：")
-            if len(api_keys_collected) > 1:
-                report_lines.append("  • 每次获取的API密钥都是不同的（包含时间戳）")
-                report_lines.append("  • 时间戳体现了执行的先后顺序")
-            else:
-                report_lines.append("  • 只有一次执行，无法进行差异对比")
-        
-        return "\n".join(report_lines)
-    
-    def _build_detailed_execution_report(self, detailed_tool_results: List[Dict], api_keys_collected: List[str], sleep_records: List[str]) -> str:
-        """构建详细的执行报告供LLM分析"""
+        Exception("LLM服务不可用，无法执行任何工具或SubAgent")
+      
+    def _build_detailed_execution_report(self, detailed_tool_results: List[Dict], tool_output_summary: Dict) -> str:
+        """构建详细的执行报告供LLM分析 - 精简版本，只显示关键的执行结果"""
         report_sections = []
         
         # 执行概况
         total_steps = len(detailed_tool_results)
-        api_count = len(api_keys_collected)
-        sleep_count = len(sleep_records)
+        report_sections.append(f"执行概况: 总共{total_steps}个步骤")
         
-        report_sections.append(f"执行概况: 总共{total_steps}个步骤, 获取{api_count}个API密钥, {sleep_count}次睡眠间隔")
-        
-        # API密钥详情
-        if api_keys_collected:
-            report_sections.append("\nAPI密钥获取详情:")
-            for i, api_key_info in enumerate(api_keys_collected, 1):
-                report_sections.append(f"  {i}. {api_key_info}")
-        
-        # 睡眠间隔详情
-        if sleep_records:
-            report_sections.append("\n睡眠间隔详情:")
-            for i, sleep_info in enumerate(sleep_records, 1):
-                report_sections.append(f"  {i}. {sleep_info}")
-        
-        # 完整执行时序
-        report_sections.append(f"\n完整执行时序:")
+        # 完整执行时序和结果 - 显示完整的工具返回数据
+        report_sections.append(f"\n执行结果详情:")
         for tool_result in detailed_tool_results:
             step = tool_result["step"]
             tool = tool_result["tool"]
             result = tool_result["result"]
             
-            if tool == "APIKey获取工具":
-                if result.get("access_granted"):
-                    api_key = result.get("apikey", "N/A")
-                    timestamp = api_key.split('_')[-1] if '_' in api_key else "无时间戳"
-                    report_sections.append(f"  步骤{step}: [API密钥获取] 成功 → 密钥: {api_key} (时间戳: {timestamp})")
+            # 显示完整的工具返回数据
+            if isinstance(result, dict):
+                # 更智能的状态判断
+                is_success = (
+                    result.get("success") is True or 
+                    result.get("access_granted") is True or
+                    result.get("ok") is True or
+                    result.get("status") == "completed"
+                )
+                status = "成功" if is_success else "完成"
+                
+                # 显示完整的关键字段，特别是apikey
+                key_info = []
+                priority_fields = ["apikey", "result", "message"]  # 优先显示的字段
+                
+                # 先添加优先字段
+                for field in priority_fields:
+                    if field in result:
+                        value = result[field]
+                        if isinstance(value, (str, int, float, bool)):
+                            key_info.append(f"{field}: {value}")
+                
+                # 再添加其他字段
+                for key, value in result.items():
+                    if key not in priority_fields and isinstance(value, (str, int, float, bool)):
+                        if len(str(value)) < 100:  # 只显示合理长度的字段
+                            key_info.append(f"{key}: {value}")
+                
+                if key_info:
+                    # 显示所有重要字段，不截断
+                    info_text = "\n    ".join(key_info)
+                    report_sections.append(f"  步骤{step}: [{tool}] {status}")
+                    report_sections.append(f"    {info_text}")
                 else:
-                    report_sections.append(f"  步骤{step}: [API密钥获取] 失败")
-            elif tool == "sleep_tool":
-                if result.get("success"):
-                    duration = result.get("duration", 0)
-                    label = result.get("label", "未知")
-                    report_sections.append(f"  步骤{step}: [睡眠间隔] 成功 → 等待{duration}秒 (标签: {label})")
-                else:
-                    report_sections.append(f"  步骤{step}: [睡眠间隔] 失败")
+                    report_sections.append(f"  步骤{step}: [{tool}] {status}")
             else:
-                status = "成功" if result.get("success", True) else "失败"
-                report_sections.append(f"  步骤{step}: [其他工具: {tool}] {status}")
+                report_sections.append(f"  步骤{step}: [{tool}] 完成 → {str(result)[:100]}")
         
         return "\n".join(report_sections)
     
@@ -880,16 +821,29 @@ class MasterAgent:
             )
         else:
             logger.info(f"🏁 规划器决定结束: {needs_analysis['reasons']}")
-            # 生成简单的总结消息，避免复杂的LLM调用
+            # 生成简单的总结消息，避免复杂的LLM调用 - 通用化处理
             summary_msg = "任务已完成"
             if state.tool_results:
                 latest_result = state.tool_results[-1]
-                if latest_result.get("tool") == "APIKey获取工具":
-                    summary_msg = f"已成功获取API密钥: {latest_result.get('result', {}).get('api_key', 'N/A')}"
-                elif latest_result.get("tool") == "sleep_tool":
-                    summary_msg = "已完成等待任务"
+                tool_name = latest_result.get("tool", "未知工具")
+                result_data = latest_result.get("result", {})
+                
+                # 通用化地提取结果信息
+                if isinstance(result_data, dict):
+                    important_info = []
+                    for key, value in result_data.items():
+                        if key in ["success", "ok", "status"]:
+                            continue
+                        elif isinstance(value, (str, int, float)) and len(str(value)) < 50:
+                            important_info.append(f"{key}: {value}")
+                    
+                    if important_info:
+                        info_text = ", ".join(important_info[:1])  # 只显示第1个重要字段
+                        summary_msg = f"已完成{tool_name}执行，结果: {info_text}"
+                    else:
+                        summary_msg = f"已完成{tool_name}执行"
                 else:
-                    summary_msg = f"已完成{latest_result.get('tool', '工具')}执行"
+                    summary_msg = f"已完成{tool_name}执行"
             
             return PlannerOutput(
                 decision="finish",
@@ -911,16 +865,17 @@ class MasterAgent:
             }
         
         try:
-            # 构建可用工具的详细描述
+            # 构建可用工具的详细描述，包含参数信息
             available_tools = []
             for tool in self.tools:
                 tool_info = {
                     "name": tool.name(),
-                    "description": tool.description()
+                    "description": tool.description(),
+                    "parameters": self._get_tool_parameters(tool)
                 }
                 available_tools.append(tool_info)
             
-            # 构建执行历史
+            # 构建执行历史 - 通用化处理，不硬编码特定字段
             execution_history = []
             for i, result in enumerate(tool_results, 1):
                 tool_name = result.get("tool", "unknown")
@@ -929,12 +884,29 @@ class MasterAgent:
                 
                 step_info = f"步骤{i}: 执行了{tool_name}"
                 if success:
-                    if isinstance(payload, dict) and payload.get("success"):
-                        step_info += " - 成功"
-                        if "apikey" in payload:
-                            step_info += f" (获得API密钥: {payload['apikey']})"
-                        elif "duration" in payload:
-                            step_info += f" (等待了{payload['duration']}秒)"
+                    if isinstance(payload, dict):
+                        # 判断具体执行状态
+                        is_tool_success = (
+                            payload.get("success") is True or 
+                            payload.get("access_granted") is True or
+                            payload.get("ok") is True or
+                            payload.get("status") == "completed"
+                        )
+                        
+                        if is_tool_success:
+                            step_info += " - 成功"
+                            
+                            # 通用化地提取重要信息，显示所有关键字段
+                            important_info = []
+                            for key, value in payload.items():
+                                if isinstance(value, (str, int, float, bool)) and len(str(value)) < 50:
+                                    important_info.append(f"{key}: {value}")
+                            
+                            if important_info:
+                                info_text = ", ".join(important_info[:3])  # 显示前3个重要字段
+                                step_info += f" ({info_text})"
+                        else:
+                            step_info += " - 失败"
                     else:
                         step_info += " - 完成"
                 else:
@@ -942,7 +914,7 @@ class MasterAgent:
                 
                 execution_history.append(step_info)
             
-            # 构建LLM决策提示词
+            # 构建LLM决策提示词 - 严格JSON格式
             system_prompt = """你是一个智能决策助手，需要根据用户需求和当前执行情况，决定下一步应该执行什么工具。
 
 决策原则：
@@ -952,18 +924,21 @@ class MasterAgent:
 4. 每次只决策一个动作，不要一次性规划多个步骤
 5. 如果任务已完成，应该选择结束
 
-返回格式（必须是有效的JSON）：
+**重要：你必须只输出JSON格式，不要有任何额外的解释文字！**
+
+返回格式（必须是纯JSON，无任何其他内容）：
 {
-    "should_continue": true/false,
-    "next_tool": "工具名称" 或 null,
-    "reasoning": "详细的决策原因",
-    "task_progress": "当前任务进度分析"
+    "decision": "continue" 或 "finish",
+    "tool": "工具名称",
+    "tool_input": {"参数名": "参数值"},
+    "finish_message": "任务完成说明（仅当decision为finish时）",
+    "reason": "简短的决策原因"
 }"""
 
             user_prompt = f"""用户原始需求: {user_input}
 
 可用工具列表:
-{chr(10).join([f"- {tool['name']}: {tool['description']}" for tool in available_tools])}
+{chr(10).join([f"- {tool['name']}: {tool['description']} | 参数: {tool['parameters']}" for tool in available_tools])}
 
 当前执行历史:
 {chr(10).join(execution_history) if execution_history else "还没有执行任何工具"}
@@ -972,11 +947,11 @@ class MasterAgent:
 1. 继续执行某个工具（如果任务未完成）
 2. 还是结束任务（如果已经满足用户需求）
 
-注意：每次只能选择一个下一步动作，不要同时规划多个步骤。"""
+**重要：只输出JSON格式，不要任何解释文字！**"""
 
             logger.info(f"🤖 调用LLM进行智能决策...")
             
-            # 调用LLM进行决策
+            # 调用LLM进行决策 - 使用基础调用方式
             llm_service = self.llm._create_llm_service()
             responses = llm_service.generate_from_input(
                 user_inputs=[user_prompt],
@@ -987,36 +962,55 @@ class MasterAgent:
                 content = responses[0].strip()
                 logger.info(f"🤖 LLM决策响应: {content}")
                 
+                # 尝试清理JSON格式 - 移除可能的markdown代码块标记
+                if content.startswith("```json"):
+                    content = content[7:]
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+                
                 # 解析LLM响应
                 try:
                     import json
                     decision = json.loads(content)
                     
-                    should_continue = decision.get("should_continue", False)
-                    next_tool = decision.get("next_tool")
-                    reasoning = decision.get("reasoning", "")
-                    task_progress = decision.get("task_progress", "")
+                    decision_type = decision.get("decision", "finish")
+                    tool_name = decision.get("tool")
+                    tool_input = decision.get("tool_input", {})
+                    finish_message = decision.get("finish_message", "")
+                    reasoning = decision.get("reason", "")
+                    
+                    # 判断是否继续
+                    should_continue = (decision_type == "continue")
                     
                     # 构建next_action
                     next_action = None
-                    if should_continue and next_tool:
+                    if should_continue and tool_name and tool_input:
                         next_action = {
-                            "tool": next_tool,
+                            "tool": tool_name,
+                            "tool_input": tool_input
+                        }
+                    elif should_continue and tool_name:
+                        # 如果只有工具名没有参数，使用用户输入作为fallback
+                        next_action = {
+                            "tool": tool_name,
                             "tool_input": {"user_message": user_input}
                         }
                     
                     result = {
                         "should_continue": should_continue,
                         "next_action": next_action,
-                        "reasons": [reasoning],
+                        "reasons": [reasoning or finish_message],
                         "analysis": {
-                            "task_progress": task_progress,
+                            "decision_type": decision_type,
                             "llm_decision": decision,
-                            "execution_count": len(tool_results)
+                            "execution_count": len(tool_results),
+                            "json_parsed": True
                         }
                     }
                     
-                    logger.info(f"🎯 LLM决策结果: continue={should_continue}, next_tool={next_tool}")
+                    logger.info(f"🎯 LLM决策结果: decision={decision_type}, tool={tool_name}")
+                    logger.info(f"🎯 工具参数: {tool_input}")
                     logger.info(f"🎯 决策原因: {reasoning}")
                     
                     return result
@@ -1050,7 +1044,8 @@ class MasterAgent:
         next_tool = None
         reasoning = "基于文本内容的简单解析"
         
-        if "继续" in content or "continue" in content_lower or "true" in content_lower:
+        # 检查决策类型
+        if "continue" in content_lower or "继续" in content:
             should_continue = True
             
             # 尝试找到工具名
@@ -1059,6 +1054,10 @@ class MasterAgent:
                 if tool_name in content:
                     next_tool = tool_name
                     break
+            
+            # 如果没找到具体工具，使用第一个工具作为fallback
+            if not next_tool and self.tools:
+                next_tool = self.tools[0].name()
         
         # 构建next_action
         next_action = None
@@ -1072,8 +1071,77 @@ class MasterAgent:
             "should_continue": should_continue,
             "next_action": next_action,
             "reasons": [reasoning],
-            "analysis": {"simple_parse": True, "execution_count": len(tool_results)}
+            "analysis": {
+                "simple_parse": True, 
+                "execution_count": len(tool_results),
+                "json_parsed": False
+            }
         }
+    
+    def _get_tool_parameters(self, tool) -> str:
+        """获取工具的参数信息 - 动态解析工具参数，不使用硬编码"""
+        try:
+            # 方法1：尝试调用工具的参数方法
+            if hasattr(tool, 'params'):
+                params_class = tool.params()
+                if hasattr(params_class, '__annotations__'):
+                    # 使用__annotations__获取类型注解
+                    annotations = params_class.__annotations__
+                    param_info = []
+                    for field_name, field_type in annotations.items():
+                        type_name = getattr(field_type, '__name__', str(field_type))
+                        param_info.append(f"{field_name}: {type_name}")
+                    return "{" + ", ".join(param_info) + "}"
+                
+                elif hasattr(params_class, '__dict__'):
+                    # 尝试从类字典获取信息
+                    class_dict = params_class.__dict__
+                    param_info = []
+                    for key, value in class_dict.items():
+                        if not key.startswith('_'):
+                            param_info.append(f"{key}: auto_detected")
+                    if param_info:
+                        return "{" + ", ".join(param_info) + "}"
+            
+            # 方法2：尝试检查工具的args_schema
+            if hasattr(tool, 'args_schema') and tool.args_schema:
+                schema = tool.args_schema
+                if hasattr(schema, '__annotations__'):
+                    annotations = schema.__annotations__
+                    param_info = []
+                    for field_name, field_type in annotations.items():
+                        type_name = getattr(field_type, '__name__', str(field_type))
+                        param_info.append(f"{field_name}: {type_name}")
+                    return "{" + ", ".join(param_info) + "}"
+            
+            # 方法3：尝试inspect工具的run方法
+            if hasattr(tool, 'run'):
+                import inspect
+                sig = inspect.signature(tool.run)
+                param_info = []
+                for param_name, param in sig.parameters.items():
+                    if param_name not in ['self', 'kwargs', 'args']:
+                        type_hint = param.annotation if param.annotation != inspect.Parameter.empty else "auto"
+                        type_name = getattr(type_hint, '__name__', str(type_hint))
+                        param_info.append(f"{param_name}: {type_name}")
+                if param_info:
+                    return "{" + ", ".join(param_info) + "}"
+            
+            # 方法4：最后fallback - 基于工具描述推断
+            description = tool.description().lower()
+            if "path" in description or "file" in description:
+                return '{"path": "string", "additional_params": "auto"}'
+            elif "query" in description or "search" in description:
+                return '{"query": "string", "additional_params": "auto"}'
+            elif "seconds" in description or "time" in description:
+                return '{"seconds": "number", "additional_params": "auto"}'
+            else:
+                return '{"user_message": "string(通用参数)"}'
+                
+        except Exception as e:
+            logger.debug(f"动态解析工具{tool.name()}参数失败: {e}")
+            # 最终fallback
+            return '{"user_message": "string(通用参数)"}'
 
 
 class MasterAgentExecutor:
