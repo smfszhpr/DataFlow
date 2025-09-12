@@ -12,87 +12,30 @@ from typing import List, Dict, Any, Optional
 
 import gradio as gr
 
-# 尝试导入真实的Master Agent
+# 导入真实的Master Agent
 try:
     project_root = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, project_root)
     
     from dataflow.agent_v2.master.agent import create_master_agent
-    REAL_MASTER_AGENT = True
     print("✅ 成功导入真实Master Agent")
 except ImportError as e:
     print(f"❌ 导入Master Agent失败: {e}")
-    print("🔄 使用模拟版本")
-    REAL_MASTER_AGENT = False
-
-# 模拟 Master Agent 功能
-class MockMasterAgent:
-    """模拟 Master Agent 用于演示"""
-    
-    def __init__(self):
-        self.tools = {
-            "former_agent": "表单生成工具",
-            "pipeline_builder": "管道构建工具", 
-            "data_analyzer": "数据分析工具",
-            "code_generator": "代码生成工具",
-            "apikey_agent": "API密钥获取工具"
-        }
-    
-    async def execute(self, message: str) -> Dict[str, Any]:
-        """模拟执行用户请求"""
-        # 模拟处理时间
-        await asyncio.sleep(1)
-        
-        # 简单的意图识别
-        if "表单" in message or "form" in message.lower():
-            tool = "former_agent"
-            result = f"📝 **Former Agent 处理结果**\n\n根据您的需求 '{message}'，我为您生成了一个表单结构：\n\n```xml\n<form>\n  <field type='text' name='username' label='用户名' required='true'/>\n  <field type='email' name='email' label='邮箱' required='true'/>\n  <field type='password' name='password' label='密码' required='true'/>\n</form>\n```"
-        elif "apikey" in message.lower() or "api key" in message.lower() or "密钥" in message or "秘密" in message:
-            tool = "apikey_agent" 
-            result = f"🔑 **模拟API密钥获取结果**\n\n❌ 当前使用模拟版本，无法调用真实APIKey SubAgent\n\n💡 **说明**: 系统识别到API密钥相关关键词，应该路由到APIKey SubAgent\n\n🎯 **期望行为**: 真实版本会返回固定密钥 `DFlow2024Secret`"
-        elif "管道" in message or "pipeline" in message.lower():
-            tool = "pipeline_builder"
-            result = f"🏗️ **Pipeline Builder 处理结果**\n\n为您的需求 '{message}' 设计了数据管道：\n\n1. 数据输入层\n2. 预处理模块\n3. 转换引擎\n4. 验证检查\n5. 输出接口\n\n✅ 管道配置已生成"
-        elif "分析" in message or "analysis" in message.lower():
-            tool = "data_analyzer"
-            result = f"📊 **Data Analyzer 处理结果**\n\n针对您的需求 '{message}'，分析报告如下：\n\n• 数据质量：良好\n• 数据规模：中等\n• 推荐处理方式：批处理\n• 预计处理时间：2-5分钟"
-        elif "代码" in message or "code" in message.lower():
-            tool = "code_generator"
-            result = f"💻 **Code Generator 处理结果**\n\n为您生成了相关代码：\n\n```python\ndef process_data(input_data):\n    # 根据需求 '{message}' 生成的代码\n    result = transform(input_data)\n    return validate(result)\n```"
-        else:
-            tool = "master_agent"
-            result = f"🤖 **Master Agent 综合处理**\n\n您的需求：'{message}'\n\n我理解您希望使用我们的智能代理系统。基于 MyScaleKB-Agent 架构，我可以为您提供：\n\n• 🤖 智能表单生成\n• 🏗️ 数据管道构建\n• 📊 数据分析处理\n• 💻 代码自动生成\n• 🔑 **API密钥获取** (新功能！)\n\n请详细描述您的具体需求，我会选择最合适的工具为您处理。\n\n💡 **提示**: 您可以尝试说\"我需要今天的API密钥\"来测试新的决策功能！"
-        
-        return {
-            "status": "completed",
-            "executed_tools": [tool],
-            "final_result": result,
-            "details": f"使用了 {self.tools.get(tool, tool)} 处理您的请求",
-            "timestamp": datetime.now().isoformat()
-        }
+    raise Exception(f"无法导入Master Agent: {e}")
 
 
 class MasterAgentWebUI:
     """Master Agent Web UI 控制器"""
     
     def __init__(self):
-        """初始化 Web UI"""
-        if REAL_MASTER_AGENT:
-            try:
-                self.master_agent, self.master_executor = create_master_agent()
-                self.agent_type = "真实"
-                print("✅ 使用真实Master Agent")
-            except Exception as e:
-                print(f"❌ 真实Master Agent初始化失败: {e}")
-                self.master_agent = MockMasterAgent()
-                self.master_executor = None
-                self.agent_type = "模拟"
-                print("🔄 回退到模拟版本")
-        else:
-            self.master_agent = MockMasterAgent()
-            self.master_executor = None
-            self.agent_type = "模拟"
-            print("🔄 使用模拟Master Agent")
+        """初始化 Web UI - 只使用真实Master Agent"""
+        try:
+            self.master_agent, self.master_executor = create_master_agent()
+            self.agent_type = "真实"
+            print("✅ 使用真实Master Agent")
+        except Exception as e:
+            print(f"❌ 真实Master Agent初始化失败: {e}")
+            raise Exception(f"Master Agent初始化失败: {e}")
         
         self.session_id = f"session_{int(time.time())}"
         self.chat_history = []
@@ -100,19 +43,11 @@ class MasterAgentWebUI:
     
     async def chat_function(self, message: str, history: List[List[str]]) -> str:
         """Gradio ChatInterface 聊天处理函数"""
-        if not self.master_agent:
-            return "❌ Master Agent 未正确初始化，无法处理请求"
-        
         try:
             print(f"\n🎯 [Master Agent] 收到用户消息: {message}")
             
-            # 执行 Master Agent
-            if self.master_executor:
-                # 使用真实的Master Agent执行器
-                result = await self.master_executor.execute(message, self.session_id)
-            else:
-                # 使用模拟的Master Agent
-                result = await self.master_agent.execute(message)
+            # 使用真实的Master Agent执行器
+            result = await self.master_executor.execute(message, self.session_id)
             
             # 格式化响应
             response = self.format_response(result)
@@ -185,7 +120,7 @@ def create_master_agent_ui():
             <h3>🏛️ 基于 MyScaleKB-Agent 的架构设计</h3>
             <p>本系统采用了与 MyScaleKB-Agent 相同的设计模式：Master Agent + SubAgent + LangGraph 状态机</p>
             <p>实现了真正的事件驱动、工具选择和 SubAgent 路由机制</p>
-            {"<p><strong>🔑 APIKey 测试密钥: DFlow2024Secret</strong></p>" if REAL_MASTER_AGENT else ""}
+            <p><strong>🔑 APIKey 测试密钥: 123121323132</strong></p>
         </div>
         """)
         
@@ -231,7 +166,7 @@ def create_master_agent_ui():
             <p>• 基于 MyScaleKB-Agent 架构，提供企业级的可靠性</p>
             <br>
             <p style='font-size: 14px; color: #666;'>
-                <strong>🚀 当前模式</strong>：{ui.agent_type}版本 - {"真正的决策功能测试" if REAL_MASTER_AGENT else "演示意图识别逻辑"}
+                <strong>🚀 当前模式</strong>：{ui.agent_type}版本 - 真正的决策功能测试
             </p>
         </div>
         """)

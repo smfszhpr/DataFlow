@@ -37,18 +37,6 @@ class AgentState(BaseModel):
     conversation_history: List[Dict[str, str]] = []  # 对话历史
     last_tool_results: Optional[Dict[str, Any]] = None  # 最近的工具结果
     
-    # 兼容LangGraph的方法
-    def model_dump(self):
-        return {
-            "input": self.input,
-            "agent_outcome": self.agent_outcome,
-            "intermediate_steps": self.intermediate_steps,
-            "session_id": self.session_id,
-            "current_step": self.current_step,
-            "conversation_history": self.conversation_history,
-            "last_tool_results": self.last_tool_results
-        }
-    
     @classmethod
     def from_dict(cls, data: Dict[str, Any]):
         return cls(**data)
@@ -441,17 +429,12 @@ class MasterAgent:
 请用中文回答，保持专业但友好的语气。"""
 
                 # 构建对话历史
-                history_text = ""
-                if conversation_history:
-                    recent_history = conversation_history[-8:]  # 最近4轮对话
-                    history_items = []
-                    for msg in recent_history:
-                        role = "用户" if msg["role"] == "user" else "助手"
-                        content = msg["content"][:200] + ("..." if len(msg["content"]) > 200 else "")
-                        history_items.append(f"{role}: {content}")
-                    history_text = f"\n\n对话历史:\n" + "\n".join(history_items)
+                history_text = self._build_history_text(conversation_history, k=8, clip=200)
+                
+                user_prompt = f"""用户问题: {user_input}
 
-                user_prompt = f"""用户问题: {user_input}{history_text}
+对话历史:
+{history_text}
 
 请基于对话历史和当前问题，给出最合适的回答。如果用户询问之前的对话内容，请准确回忆。如果问题可能需要专业工具协助（如API密钥获取、表单生成、数据分析、代码生成等），请主动建议。"""
 
@@ -585,56 +568,8 @@ class MasterAgent:
         logger.info("⚠️ 无匹配条件，默认路由到general_conversation")
         return "general_conversation"
     def _simple_keyword_fallback(self, user_input: str) -> Optional[Dict[str, Any]]:
-        """简单关键词匹配fallback（当LLM不可用时）"""
-        user_input_lower = user_input.lower()
-        
-        # API密钥相关关键词
-        apikey_keywords = ["apikey", "api key", "密钥", "秘密", "今天", "认证", "授权"]
-        if any(keyword in user_input_lower for keyword in apikey_keywords):
-            return {
-                "name": "APIKey获取工具",
-                "input": {
-                    "user_message": user_input
-                }
-            }
-        
-        # 表单生成相关关键词
-        form_keywords = ["表单", "配置", "算子", "创建", "生成", "需求", "xml"]
-        if any(keyword in user_input_lower for keyword in form_keywords):
-            return {
-                "name": "former_agent",
-                "input": {
-                    "user_query": user_input,
-                    "session_id": None,
-                    "conversation_history": []
-                }
-            }
-        
-        # 数据分析相关关键词
-        analysis_keywords = ["分析", "数据", "洞察", "统计", "报告"]
-        if any(keyword in user_input_lower for keyword in analysis_keywords):
-            return {
-                "name": "data_analysis", 
-                "input": {
-                    "data_path": "default_dataset.csv",
-                    "analysis_type": "basic",
-                    "output_format": "summary"
-                }
-            }
-        
-        # 代码生成相关关键词
-        code_keywords = ["代码", "编程", "实现", "函数", "算法"]
-        if any(keyword in user_input_lower for keyword in code_keywords):
-            return {
-                "name": "code_generator",
-                "input": {
-                    "requirements": user_input,
-                    "operator_type": "processor",
-                    "language": "python"
-                }
-            }
-        
-        return None
+        """当LLM不可用时，所有SubAgent都没有意义，直接抛出错误"""
+        raise Exception("LLM服务不可用，无法执行任何工具或SubAgent")
     
     def _find_tool(self, tool_name: str) -> Optional[BaseTool]:
         """查找工具"""
@@ -642,69 +577,25 @@ class MasterAgent:
             if tool.name() == tool_name:
                 return tool
         return None
+    
+    def _build_history_text(self, conversation_history: List[Dict[str, str]], k: int = 8, clip: int = 200) -> str:
+        """把最近 k 条历史拼成统一文本；长消息裁剪到 clip 字符。"""
+        if not conversation_history:
+            return ""
+
+        recent = conversation_history[-k:]
+        lines = []
+        for msg in recent:
+            role = "用户" if msg.get("role") == "user" else "助手"
+            content = msg.get("content", "")
+            if len(content) > clip:
+                content = content[:clip] + "..."
+            lines.append(f"{role}: {content}")
+        return "\n".join(lines)
     
     def _get_fallback_response(self, user_input: str, conversation_history: List[Dict[str, str]]) -> str:
         """Fallback响应 - 不做假装回复，直接抛出异常"""
         raise Exception("LLM服务不可用，无法处理对话")
-    
-    @node()
-    async def execute_tools(self, state: AgentState) -> AgentState:
-        """执行工具"""
-        agent_outcome = state.agent_outcome
-        if not isinstance(agent_outcome, list):
-            return state
-        
-        intermediate_steps = []
-        
-        for action in agent_outcome:
-            if isinstance(action, AgentAction):
-                tool_name = action.tool
-                tool_input = action.tool_input
-                
-                logger.info(f"执行工具: {tool_name}, 参数: {tool_input}")
-                
-                # 查找并执行工具
-                tool = self._find_tool(tool_name)
-                if tool:
-                    try:
-                        result = await tool.execute(**tool_input)
-                        intermediate_steps.append((action, str(result)))
-                    except Exception as e:
-                        logger.error(f"工具执行失败: {e}")
-                        intermediate_steps.append((action, f"执行失败: {str(e)}"))
-                else:
-                    intermediate_steps.append((action, f"未找到工具: {tool_name}"))
-        
-        state.intermediate_steps = intermediate_steps
-        return state
-    
-    def _find_tool(self, tool_name: str) -> Optional[BaseTool]:
-        """查找工具"""
-        for tool in self.tools:
-            if tool.name() == tool_name:
-                return tool
-        return None
-    
-    @node()
-    async def summarize(self, state: AgentState) -> AgentState:
-        """总结阶段 - 使用LLM基于工具结果与用户对话"""
-        if isinstance(state.agent_outcome, AgentFinish):
-            # 如果已经是最终结果，直接返回
-            return state
-        
-        # 使用LLM基于工具执行结果进行智能对话
-        if state.intermediate_steps:
-            final_output = await self._generate_conversation_response(state)
-        else:
-            # 如果没有工具执行，直接使用通用对话回复
-            final_output = await self._get_direct_conversation_response(state)
-        
-        finish = AgentFinish(
-            return_values={"output": final_output}
-        )
-        state.agent_outcome = finish
-        
-        return state
     
     async def _generate_conversation_response(self, state: AgentState) -> str:
         """基于工具执行结果和对话历史生成智能响应"""
@@ -763,14 +654,7 @@ class MasterAgent:
 请根据用户问题和上下文，给出最合适的回答。"""
 
             # 构建对话历史文本
-            history_text = ""
-            if conversation_history:
-                recent_history = conversation_history[-10:]  # 最近5轮对话
-                history_items = []
-                for i, msg in enumerate(recent_history):
-                    role = "用户" if msg["role"] == "user" else "助手"
-                    history_items.append(f"{role}: {msg['content']}")
-                history_text = f"\n\n最近对话历史:\n" + "\n".join(history_items)
+            history_text = self._build_history_text(conversation_history, k=10, clip=300)
             
             # 构建工具结果描述
             tools_info = ""
@@ -797,7 +681,13 @@ class MasterAgent:
                 
                 tools_info = f"\n\n刚刚执行的工具结果:\n" + "\n".join(tools_info_list)
             
-            user_prompt = f"""当前用户问题: {user_input}{history_text}{tools_info}
+            user_prompt = f"""当前用户问题: {user_input}
+
+对话历史:
+{history_text}
+
+工具执行结果:
+{tools_info}
 
 请基于以上信息自然地回答用户的问题。如果用户询问对话历史中的内容，请准确回忆。"""
 
@@ -832,52 +722,25 @@ class MasterAgent:
         
         return "✅ 操作完成"
     
-    @node()
-    async def handle_no_tool_case(self, state: AgentState) -> AgentState:
-        """处理无需工具的通用对话场景 - 直接使用LLM"""
-        user_input = state.input
-        conversation_history = state.conversation_history
-        
-        # 直接使用LLM进行对话
-        if self.llm.api_available:
-            try:
-                # 简单直接的提示
-                system_prompt = "你是DataFlow智能助手，请直接、自然地回答用户问题。"
-                user_prompt = f"用户问题: {user_input}"
-                
-                # 调用LLM
-                llm_service = self.llm._create_llm_service()
-                responses = llm_service.generate_from_input(
-                    user_inputs=[user_prompt],
-                    system_prompt=system_prompt
-                )
-                
-                if responses and responses[0]:
-                    response = responses[0].strip()
-                    
-                    finish = AgentFinish(
-                        return_values={"output": response}
-                    )
-                    state.agent_outcome = finish
-                    return state
-                    
-            except Exception as e:
-                logger.error(f"LLM调用失败: {e}")
-                # 直接抛出异常，不做假装回复
-                raise e
-        
-        # LLM不可用时直接抛出异常
-        raise Exception("LLM服务不可用，无法处理通用对话")
-    
     async def _get_direct_conversation_response(self, state: AgentState) -> str:
         """当没有工具执行时，获取直接对话回复"""
         user_input = state.input
+        conversation_history = state.conversation_history
         
         # 直接使用LLM，不做fallback
         if self.llm.api_available:
             try:
                 system_prompt = "你是DataFlow智能助手，请直接、自然地回答用户问题。"
-                user_prompt = f"用户问题: {user_input}"
+                
+                # 构建对话历史
+                history_text = self._build_history_text(conversation_history, k=8, clip=200)
+                
+                user_prompt = f"""用户问题: {user_input}
+
+对话历史:
+{history_text}
+
+请基于对话历史自然地回答用户问题。"""
                 
                 llm_service = self.llm._create_llm_service()
                 responses = llm_service.generate_from_input(
@@ -1003,24 +866,3 @@ def create_master_agent() -> Tuple[MasterAgent, MasterAgentExecutor]:
     agent = MasterAgent()
     executor = MasterAgentExecutor(agent)
     return agent, executor
-
-
-if __name__ == "__main__":
-    # 测试代码
-    async def test_master_agent():
-        agent, executor = create_master_agent()
-        
-        # 测试用例
-        test_cases = [
-            "我想创建一个情感分析算子",
-            "帮我分析一下数据集",
-            "生成一个文本处理的代码",
-            "不知道你能做什么"
-        ]
-        
-        for query in test_cases:
-            print(f"\n🤖 用户: {query}")
-            result = await executor.execute(query)
-            print(f"🔮 Master Agent: {result['output']}")
-    
-    # asyncio.run(test_master_agent())
