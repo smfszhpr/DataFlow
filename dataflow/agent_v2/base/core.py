@@ -98,7 +98,11 @@ def node(func):
         
         try:
             # 为 Pydantic 模型添加元数据
-            if hasattr(data, '__dict__'):
+            if hasattr(data, 'agent_metadata'):
+                # 对于 Pydantic 模型，使用 setattr 或直接赋值
+                data.agent_metadata = agent_metadata
+            elif hasattr(data, '__dict__'):
+                # 对于普通对象，直接设置属性
                 data.agent_metadata = agent_metadata
             
             # 执行原始函数
@@ -115,7 +119,10 @@ def node(func):
             )
             
             if not result:
-                if hasattr(data, '__dict__'):
+                if hasattr(data, 'agent_metadata'):
+                    data.agent_metadata = agent_metadata
+                    return data
+                elif hasattr(data, '__dict__'):
                     data.agent_metadata = agent_metadata
                     return data
                 else:

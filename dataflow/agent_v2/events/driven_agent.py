@@ -78,18 +78,20 @@ class EventDrivenMasterAgent:
             output = "执行完成"
             
             # 优先从final_state.output获取
-            if hasattr(final_state, 'output') and final_state.output:
-                output = final_state.output
+            if final_state.get('output'):
+                output = final_state['output']
             # 其次从agent_outcome获取
-            elif hasattr(final_state, 'agent_outcome') and final_state.agent_outcome:
-                if hasattr(final_state.agent_outcome, 'return_values'):
-                    output = final_state.agent_outcome.return_values.get("output", output)
-                elif hasattr(final_state.agent_outcome, 'output'):
-                    output = final_state.agent_outcome.output
+            elif final_state.get('agent_outcome'):
+                agent_outcome = final_state['agent_outcome']
+                if hasattr(agent_outcome, 'return_values'):
+                    output = agent_outcome.return_values.get("output", output)
+                elif hasattr(agent_outcome, 'output'):
+                    output = agent_outcome.output
             # 最后从intermediate_steps获取
-            elif hasattr(final_state, 'intermediate_steps') and final_state.intermediate_steps:
-                steps_count = max(steps_count, len(final_state.intermediate_steps))
-                last_step = final_state.intermediate_steps[-1]
+            elif final_state.get('intermediate_steps'):
+                intermediate_steps = final_state['intermediate_steps']
+                steps_count = max(steps_count, len(intermediate_steps))
+                last_step = intermediate_steps[-1]
                 if len(last_step) >= 2:
                     output = f"工具执行结果: {last_step[1]}"
             
@@ -116,8 +118,10 @@ class EventDrivenMasterAgent:
             }
             
         except Exception as e:
+            import traceback
             error_msg = f"执行失败: {str(e)}"
             logger.error(f"❌ {error_msg}")
+            logger.error(f"错误详情:\n{traceback.format_exc()}")
             
             await self._emit_event(self.current_event_builder.run_error(
                 error=error_msg,
@@ -137,7 +141,7 @@ class EventDrivenMasterAgent:
     async def _execute_with_langgraph_events(self, state: AgentState) -> tuple[AgentState, int]:
         """使用LangGraph原生astream_events执行，参考myscalekb-agent的实现"""
         
-        graph = self.base_agent.compiled_graph
+        graph = self.base_agent.build_app()
         step_count = 0  # 🚀 优化：基于工具完成次数统计
         final_state = state
         root_finished = False
@@ -288,9 +292,10 @@ class EventDrivenMasterAgent:
         # 🚀 优化：只处理关键节点的结束事件
         if event_name == "planner":
             # 检查是否有下一步动作
-            has_next_action = bool(getattr(current_state, 'agent_outcome', None))
-            if hasattr(current_state, 'agent_outcome') and isinstance(current_state.agent_outcome, list):
-                has_next_action = len(current_state.agent_outcome) > 0
+            agent_outcome = current_state.get('agent_outcome')
+            has_next_action = bool(agent_outcome)
+            if isinstance(agent_outcome, list):
+                has_next_action = len(agent_outcome) > 0
                 
             await self._emit_event(self.current_event_builder.plan_decision({
                 "planning_completed": True,
@@ -302,16 +307,16 @@ class EventDrivenMasterAgent:
             summary = "总结完成"
             if isinstance(output_data, dict):
                 summary = output_data.get("output", summary)
-                if hasattr(output_data, "agent_outcome") and hasattr(output_data.agent_outcome, "return_values"):
-                    summary = output_data.agent_outcome.return_values.get("output", summary)
+                agent_outcome = output_data.get("agent_outcome")
+                if agent_outcome and hasattr(agent_outcome, "return_values"):
+                    summary = agent_outcome.return_values.get("output", summary)
             
-            await self._emit_event(self.current_event_builder.summarize_finished(summary=summary))
+            # 不发送 summarize_finished 事件，避免与 run_finished 重复
+            # await self._emit_event(self.current_event_builder.summarize_finished(summary=summary))
         
         # 更新状态
-        if isinstance(output_data, dict) and hasattr(current_state, '__dict__'):
-            for key, value in output_data.items():
-                if hasattr(current_state, key):
-                    setattr(current_state, key, value)
+        if isinstance(output_data, dict) and isinstance(current_state, dict):
+            current_state.update(output_data)
         
         return current_state
     
