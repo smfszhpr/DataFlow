@@ -6,9 +6,8 @@ import logging
 import asyncio
 import time
 import uuid
-from typing import Dict, List, Any, Union, Optional, Tuple, Protocol
+from typing import Dict, List, Any, Union, Optional, Tuple
 from pydantic import BaseModel
-from dataclasses import dataclass
 from enum import Enum
 
 # LangGraph核心组件
@@ -18,14 +17,16 @@ from langchain_core.tools import StructuredTool
 from langchain_core.agents import AgentFinish as LCAgentFinish, AgentAction as LCAgentAction
 from dataflow.agent_v2.base.core import SubAgent, GraphBuilder, BaseTool
 
+# 导入事件系统
+from ..events.core import EventSink, Event, EventType
+
 
 from dataflow.agent_v2.llm_client import get_llm_client
 from dataflow.agent_v2.subagents.apikey_agent import APIKeyTool
 from dataflow.agent_v2.subagents.mock_tools import SleepTool, MockSearchTool, MockFormerTool, MockCodeGenTool
 from dataflow.agent_v2.subagents.csvtools import CSVProfileTool, CSVDetectTimeColumnsTool, CSVVegaSpecTool, ASTStaticCheckTool, UnitTestStubTool, LocalIndexBuildTool, LocalIndexQueryTool
 
-from langchain_core.tools import StructuredTool
-from langgraph.prebuilt import ToolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 def to_langchain_tool(tool: BaseTool) -> StructuredTool:
     ArgsSchema = tool.params()  # 你的工具已经提供了 Pydantic 参数类
@@ -42,29 +43,6 @@ def to_langchain_tool(tool: BaseTool) -> StructuredTool:
         return_direct=False,                  # 常规情况 False；需要时可 True
     )
 
-
-# 事件协议定义
-class EventType(str, Enum):
-    RUN_STARTED = "run_started"
-    PLAN_DECISION = "plan_decision"
-    TOOL_STARTED = "tool_started"
-    TOOL_RESULT = "tool_result"
-    TOOL_ERROR = "tool_error"
-    NODE_ENTER = "node_enter"
-    NODE_EXIT = "node_exit"
-    RUN_FINISHED = "run_finished"
-
-
-class Event(BaseModel):
-    session_id: str
-    step_id: str         # 例如 "step-001" 方便前端做去重/排序
-    event: EventType
-    data: Dict[str, Any] # 载荷（工具名、参数摘要、结果摘要、决策等）
-    ts: float            # time.time()
-
-
-class EventSink(Protocol):
-    async def emit(self, event: Event) -> None: ...
 
 def new_step_id() -> str:
     return f"step-{uuid.uuid4().hex[:8]}"
@@ -506,7 +484,7 @@ class MasterAgent:
         return state
     
     def action_forward(self, state: AgentState) -> str:
-        """决定下一步动作 - 参照MyScaleKB-Agent的action_forward"""
+        """决定下一步动作 - 修复版本，正确处理工具执行后的路由"""
         logger.info(f"🔀 Action Forward开始，agent_outcome类型: {type(state.agent_outcome)}")
         logger.info(f"🔀 Agent outcome内容: {state.agent_outcome}")
         
@@ -515,6 +493,20 @@ class MasterAgent:
             logger.info("📝 检测到return_values，结束流程")
             return "end"
 
+        # 🔧 关键修复：检查是否达到最大步数或有next_action标志
+        if hasattr(state, 'next_action') and state.next_action == "finish":
+            logger.info("🏁 检测到finish标志，进入总结阶段")
+            return "summarize"
+        
+        # 🔧 如果agent_outcome为空列表，根据上下文判断
+        if isinstance(state.agent_outcome, list) and len(state.agent_outcome) == 0:
+            # 检查是否有loop_guard（表示在planner中达到最大步数）
+            if hasattr(state, 'loop_guard') and state.loop_guard >= getattr(state, 'max_steps', 8):
+                logger.info("🛑 达到最大步数，进入总结阶段")
+                return "summarize"
+            else:
+                logger.info("🔄 工具执行完成，回到planner继续决策")
+                return "planner"
         
         # 获取agent_action - 直接使用agent_outcome或从列表中取第一个
         if isinstance(state.agent_outcome, list):
@@ -659,8 +651,7 @@ class MasterAgent:
             
             # 调用LLM生成智能总结 - 增加超时控制
             try:
-                import asyncio
-                from concurrent.futures import ThreadPoolExecutor
+                
                 
                 def sync_llm_call():
                     try:
@@ -705,9 +696,8 @@ class MasterAgent:
             logger.error(f"LLM智能总结生成失败: {e}")
             import traceback
             logger.error(f"详细错误: {traceback.format_exc()}")
-        
-        # fallback到增强格式化
-        Exception("LLM服务不可用，无法执行任何工具或SubAgent")
+            # 直接抛出异常，不使用fallback
+            raise e
       
     def _build_detailed_execution_report(self, detailed_tool_results: List[Dict], tool_output_summary: Dict) -> str:
         """构建详细的执行报告供LLM分析 - 精简版本，只显示关键的执行结果"""
@@ -854,7 +844,7 @@ class MasterAgent:
     def _analyze_user_needs(self, user_input: str, tool_results: List[Dict]) -> Dict[str, Any]:
         """让LLM智能分析用户需求和当前执行状态，决定下一步行动 - 完全基于LLM决策"""
         
-        # 🔧 核心修复：完全去掉关键词匹配，让LLM来理解和决策
+        # 🔧 核心修复：让LLM来理解和决策
         if not self.llm.api_available:
             # LLM不可用时的简单fallback
             return {
@@ -1019,8 +1009,7 @@ class MasterAgent:
                     logger.error(f"LLM响应JSON解析失败: {e}")
                     logger.error(f"原始响应: {content}")
                     
-                    # 尝试简单解析
-                    return self._simple_parse_llm_response(content, tool_results)
+                    return 
             
         except Exception as e:
             logger.error(f"LLM智能决策失败: {e}")
@@ -1033,49 +1022,6 @@ class MasterAgent:
             "next_action": None,
             "reasons": ["智能决策失败，结束任务"],
             "analysis": {}
-        }
-    
-    def _simple_parse_llm_response(self, content: str, tool_results: List[Dict]) -> Dict[str, Any]:
-        """简单解析LLM响应的fallback方法"""
-        content_lower = content.lower()
-        
-        # 简单判断是否应该继续
-        should_continue = False
-        next_tool = None
-        reasoning = "基于文本内容的简单解析"
-        
-        # 检查决策类型
-        if "continue" in content_lower or "继续" in content:
-            should_continue = True
-            
-            # 尝试找到工具名
-            for tool in self.tools:
-                tool_name = tool.name()
-                if tool_name in content:
-                    next_tool = tool_name
-                    break
-            
-            # 如果没找到具体工具，使用第一个工具作为fallback
-            if not next_tool and self.tools:
-                next_tool = self.tools[0].name()
-        
-        # 构建next_action
-        next_action = None
-        if should_continue and next_tool:
-            next_action = {
-                "tool": next_tool,
-                "tool_input": {"user_message": "继续执行"}
-            }
-        
-        return {
-            "should_continue": should_continue,
-            "next_action": next_action,
-            "reasons": [reasoning],
-            "analysis": {
-                "simple_parse": True, 
-                "execution_count": len(tool_results),
-                "json_parsed": False
-            }
         }
     
     def _get_tool_parameters(self, tool) -> str:
