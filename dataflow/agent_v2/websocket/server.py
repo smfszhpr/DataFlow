@@ -81,7 +81,7 @@ async def handle_user_input(user_input: str, session_id: str):
         print_sink = PrintSink(f"🎭[{session_id[:8]}]")
         composite_sink = CompositeSink([ws_sink, print_sink])
         
-        logger.info(f"🎯 开始处理用户输入: {user_input} (会话: {session_id})")
+        logger.debug(f"🎯 开始处理用户输入: {user_input} (会话: {session_id})")
         
         # 执行Agent
         result = await event_executor.run_with_events(
@@ -90,7 +90,7 @@ async def handle_user_input(user_input: str, session_id: str):
             sink=composite_sink
         )
         
-        logger.info(f"✅ 用户输入处理完成: {session_id}")
+        logger.debug(f"✅ 用户输入处理完成: {session_id}")
         
     except Exception as e:
         logger.error(f"❌ 处理用户输入失败 {session_id}: {e}")
@@ -164,7 +164,7 @@ async def root():
     <style>
         body { font-family: Arial, sans-serif; margin: 40px; }
         .container { max-width: 800px; margin: 0 auto; }
-        .event { margin: 5px 0; padding: 8px; background: #f5f5f5; border-radius: 4px; font-family: monospace; }
+        .event { margin: 5px 0; padding: 8px; background: #f5f5f5; border-radius: 4px; font-family: monospace; white-space: pre-wrap; word-wrap: break-word; }
         .event.run_started { background: #e8f5e8; border-left: 4px solid #4caf50; }
         .event.tool_started { background: #e3f2fd; border-left: 4px solid #2196f3; }
         .event.tool_finished { background: #e8f5e8; border-left: 4px solid #4caf50; }
@@ -176,7 +176,7 @@ async def root():
         .event.user_input { background: #e1f5fe; border-left: 4px solid #00bcd4; }
         input, button { padding: 10px; margin: 5px; }
         #input { width: 400px; }
-        #events { height: 400px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; }
+        #events { height: 500px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; }
     </style>
 </head>
 <body>
@@ -245,7 +245,7 @@ async def root():
                     content += ` - 开始执行: ${data.data.tool_name}`;
                     if (data.data.tool_input) {
                         const input = JSON.stringify(data.data.tool_input);
-                        content += ` | 输入: ${input.length > 50 ? input.substring(0, 47) + '...' : input}`;
+                        content += ` | 输入: ${input}`;
                     }
                 } else if (data.type === 'tool_finished') {
                     content += ` - 完成: ${data.data.tool_name}`;
@@ -266,14 +266,12 @@ async def root():
                 } else if (data.type === 'summarize_finished') {
                     content += ` - 总结完成`;
                     if (data.data.summary) {
-                        const summary = data.data.summary;
-                        content += ` | ${summary.length > 100 ? summary.substring(0, 97) + '...' : summary}`;
+                        content += ` | ${data.data.summary}`;
                     }
                 } else if (data.type === 'run_finished') {
                     content += ' - 执行完成';
                     if (data.data.result) {
-                        const result = data.data.result;
-                        content += ` | 最终结果: ${result.length > 150 ? result.substring(0, 147) + '...' : result}`;
+                        content += ` | 最终结果: ${data.data.result}`;
                     }
                 } else if (data.type === 'state_update') {
                     content += ` - 状态: ${data.data.state_info?.phase || data.data.phase || '未知'}`;

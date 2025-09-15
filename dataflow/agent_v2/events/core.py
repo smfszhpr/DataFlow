@@ -233,13 +233,40 @@ class EventBuilder:
             data={**extra}
         )
     
-    def summarize_finished(self, summary: str, **extra) -> Event:
+    def summarize_finished(self, summary: str = None, **extra) -> Event:
         """创建总结完成事件"""
         return Event(
             type=EventType.SUMMARIZE_FINISHED,
             session_id=self.session_id,
             step_id=self._next_step_id(),
-            data={"summary": summary, **extra}
+            data={"summary": summary or "总结完成", **extra}
+        )
+    
+    def model_started(self, **extra) -> Event:
+        """创建模型生成开始事件"""
+        return Event(
+            type=EventType.STATE_UPDATE,
+            session_id=self.session_id,
+            step_id=self._next_step_id(),
+            data={"phase": "model_started", **extra}
+        )
+    
+    def model_streaming(self, content: str, **extra) -> Event:
+        """创建模型流式生成事件"""
+        return Event(
+            type=EventType.STATE_UPDATE,
+            session_id=self.session_id,
+            step_id=self._next_step_id(),
+            data={"phase": "model_streaming", "content": content, **extra}
+        )
+    
+    def model_finished(self, **extra) -> Event:
+        """创建模型生成完成事件"""
+        return Event(
+            type=EventType.STATE_UPDATE,
+            session_id=self.session_id,
+            step_id=self._next_step_id(),
+            data={"phase": "model_finished", **extra}
         )
     
     def state_update(self, state_info: Dict[str, Any], **extra) -> Event:

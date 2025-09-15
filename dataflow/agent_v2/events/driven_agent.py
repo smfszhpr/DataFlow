@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Event-Driven Master Agent - 从底层重新实现支持实时事件推送的Master Agent
+Event-Driven Master Agent - 基于LangGraph astream的实时事件推送
 """
 
 import asyncio
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class EventDrivenMasterAgent:
-    """事件驱动的Master Agent - 原生支持实时事件推送"""
+    """事件驱动的Master Agent - 使用LangGraph原生astream消除代码冗余"""
     
     def __init__(self, base_master_agent: MasterAgent):
         """基于现有Master Agent创建事件驱动版本"""
@@ -46,7 +46,7 @@ class EventDrivenMasterAgent:
             # 发送执行开始事件
             await self._emit_event(self.current_event_builder.run_started(
                 user_input=user_input,
-                execution_mode="event_driven_native"
+                execution_mode="event_driven_langgraph"
             ))
             
             # 获取会话历史
@@ -71,13 +71,27 @@ class EventDrivenMasterAgent:
                 "conversation_history_length": len(conversation_history)
             }))
             
-            # 执行工作流 - 使用可靠的手工路由，确保事件流正常
-            final_state = await self._execute_workflow_with_events(state)
+            # 🔧 使用LangGraph原生astream_events，消除代码冗余
+            final_state, steps_count = await self._execute_with_langgraph_events(state)
             
-            # 获取最终输出
-            output = "执行完成，但未获取到输出"
-            if hasattr(final_state, 'agent_outcome') and hasattr(final_state.agent_outcome, 'return_values'):
-                output = final_state.agent_outcome.return_values.get("output", "执行完成")
+            # 🚀 优化：简化最终输出获取逻辑
+            output = "执行完成"
+            
+            # 优先从final_state.output获取
+            if hasattr(final_state, 'output') and final_state.output:
+                output = final_state.output
+            # 其次从agent_outcome获取
+            elif hasattr(final_state, 'agent_outcome') and final_state.agent_outcome:
+                if hasattr(final_state.agent_outcome, 'return_values'):
+                    output = final_state.agent_outcome.return_values.get("output", output)
+                elif hasattr(final_state.agent_outcome, 'output'):
+                    output = final_state.agent_outcome.output
+            # 最后从intermediate_steps获取
+            elif hasattr(final_state, 'intermediate_steps') and final_state.intermediate_steps:
+                steps_count = max(steps_count, len(final_state.intermediate_steps))
+                last_step = final_state.intermediate_steps[-1]
+                if len(last_step) >= 2:
+                    output = f"工具执行结果: {last_step[1]}"
             
             # 保存对话历史
             conversation_history.append({"role": "user", "content": user_input})
@@ -91,14 +105,14 @@ class EventDrivenMasterAgent:
             # 发送执行完成事件
             await self._emit_event(self.current_event_builder.run_finished(
                 result=output,
-                total_steps=len(final_state.intermediate_steps or [])
+                total_steps=steps_count
             ))
             
             return {
                 "success": True,
                 "output": output,
                 "session_id": session_id,
-                "steps_count": len(final_state.intermediate_steps or [])
+                "steps_count": steps_count
             }
             
         except Exception as e:
@@ -119,128 +133,182 @@ class EventDrivenMasterAgent:
         finally:
             self.current_sink = None
             self.current_event_builder = None
-    
-    async def _execute_workflow_with_events(self, state: AgentState) -> AgentState:
-        """手工执行工作流逻辑，确保实时事件正常发送"""
+
+    async def _execute_with_langgraph_events(self, state: AgentState) -> tuple[AgentState, int]:
+        """使用LangGraph原生astream_events执行，参考myscalekb-agent的实现"""
         
-        max_iterations = 10
-        current_step = "bootstrap"
+        graph = self.base_agent.compiled_graph
+        step_count = 0  # 🚀 优化：基于工具完成次数统计
+        final_state = state
+        root_finished = False
         
-        for iteration in range(max_iterations):
-            logger.info(f"🔄 工作流第 {iteration + 1} 轮，当前步骤: {current_step}")
-            
-            # 防止无限循环
-            if iteration >= max_iterations - 1:
-                logger.warning(f"⚠️ 达到最大迭代次数 ({max_iterations})，强制进入总结阶段")
-                current_step = "summarize"
-            
-            if current_step == "bootstrap":
-                await self._emit_event(self.current_event_builder.state_update({
-                    "phase": "bootstrap_started",
-                    "iteration": iteration + 1
-                }))
-                
-                state = await self.base_agent.bootstrap_node(state)
-                
-                await self._emit_event(self.current_event_builder.state_update({
-                    "phase": "bootstrap_completed",
-                    "has_agent_outcome": hasattr(state, 'agent_outcome') and state.agent_outcome is not None
-                }))
-                
-                current_step = self.base_agent.action_forward(state)
-                logger.info(f"📍 Bootstrap 路由结果: {current_step}")
-                
-            elif current_step == "execute_tools":
-                # 🔧 修复：正确处理agent_outcome的list形态
-                if hasattr(state, 'agent_outcome'):
-                    ao = state.agent_outcome
-                    if isinstance(ao, list) and ao:
-                        action = ao[0]  # 取第一个action
-                        tool_name = getattr(action, "tool", "unknown")
-                        tool_input = getattr(action, "tool_input", {})
-                        
-                        await self._emit_event(self.current_event_builder.tool_started(
-                            tool_name=tool_name,
-                            tool_input=tool_input
-                        ))
-                        logger.info(f"🔧 开始执行工具: {tool_name}")
-                
-                state = await self.base_agent.execute_tools_node(state)
-                
-                if hasattr(state, 'intermediate_steps') and state.intermediate_steps:
-                    latest_action, latest_result = state.intermediate_steps[-1]
-                    await self._emit_event(self.current_event_builder.tool_finished(
-                        tool_name=latest_action.tool,
-                        tool_output=latest_result
-                    ))
-                    logger.info(f"✅ 工具执行完成: {latest_action.tool}")
-                
-                current_step = "planner"
-                logger.info(f"📍 Execute Tools 完成，回到planner继续决策")
-                
-            elif current_step == "planner":
-                await self._emit_event(self.current_event_builder.plan_started())
-                logger.info("🧠 开始规划阶段")
-                
-                state = await self.base_agent.planner_node(state)
-                
-                decision_info = {
-                    "planning_completed": True,
-                    "has_next_action": hasattr(state, 'agent_outcome') and state.agent_outcome is not None,
-                    "iteration": iteration + 1
-                }
-                await self._emit_event(self.current_event_builder.plan_decision(decision_info))
-                logger.info("📋 规划阶段完成")
-                
-                current_step = self.base_agent.action_forward(state)
-                logger.info(f"📍 Planner 路由结果: {current_step}")
-                
-            elif current_step == "general_conversation":
-                await self._emit_event(self.current_event_builder.state_update({
-                    "phase": "general_conversation_started"
-                }))
-                
-                state = await self.base_agent.general_conversation_node(state)
-                
-                await self._emit_event(self.current_event_builder.state_update({
-                    "phase": "general_conversation_completed"
-                }))
-                
-                current_step = self.base_agent.action_forward(state)
-                logger.info(f"� General Conversation 路由结果: {current_step}")
-                
-            elif current_step == "summarize" or current_step == "end":
-                await self._emit_event(self.current_event_builder.summarize_started())
-                logger.info("📝 开始总结阶段")
-                
-                state = await self.base_agent.summarize_node(state)
-                
-                summary = "总结完成"
-                if hasattr(state, 'agent_outcome') and hasattr(state.agent_outcome, 'return_values'):
-                    summary = state.agent_outcome.return_values.get('output', '总结完成')
-                
-                await self._emit_event(self.current_event_builder.summarize_finished(summary=summary))
-                logger.info("✅ 总结阶段完成")
-                
-                break
-                
-            else:
-                logger.warning(f"⚠️ 未知的路由结果: {current_step}，强制进入总结阶段")
-                current_step = "summarize"
+        # 使用astream_events获取标准事件流 - 借鉴myscalekb-agent的方法
+        async for event in graph.astream_events(state, config={"recursion_limit": 15}, version="v2"):
+            # 过滤隐藏事件
+            if "langsmith:hidden" in event.get("tags", []):
                 continue
+                
+            kind = event["event"]
+            run_id = event.get("run_id")
+            event_name = event.get("name", "")
+            tags = event.get("tags", [])
+            
+            logger.debug(f"🔄 LangGraph事件: {kind} | 名称: {event_name}")
+            
+            # 🎯 优化：识别根图结束事件获取最终状态
+            if kind == "on_chain_end" and ("langgraph:root" in tags or event_name in ["graph", "compiled_graph"]):
+                output_data = event.get("data", {}).get("output", {})
+                logger.debug(f"🏁 根图结束，获取最终状态: {type(output_data)}")
+                
+                if isinstance(output_data, dict):
+                    try:
+                        # 尝试从字典构造AgentState
+                        for key, value in output_data.items():
+                            if hasattr(final_state, key):
+                                setattr(final_state, key, value)
+                        logger.debug(f"✅ 最终状态更新成功")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 最终状态更新失败: {e}")
+                root_finished = True
+                
+            # 处理不同类型的事件
+            elif kind == "on_chain_start":
+                # 🚀 优化：不再用chain_start统计步数
+                await self._handle_chain_start_event(event)
+                
+            elif kind == "on_tool_start":
+                await self._handle_tool_start_event(event)
+                
+            elif kind == "on_tool_end":
+                # 🚀 优化：基于工具完成统计实际执行步数
+                step_count += 1
+                await self._handle_tool_end_event(event)
+                
+            elif kind == "on_chat_model_start":
+                await self._handle_model_start_event(event)
+                
+            elif kind == "on_chat_model_stream":
+                await self._handle_model_stream_event(event)
+                
+            elif kind == "on_chat_model_end":
+                await self._handle_model_end_event(event)
+                
+            elif kind == "on_chain_end":
+                final_state = await self._handle_chain_end_event(event, final_state)
         
-        # 确保有最终输出
-        if not (hasattr(state, 'agent_outcome') and hasattr(state.agent_outcome, 'return_values')):
-            logger.warning("⚠️ 工作流结束但没有最终输出，强制执行总结")
-            state = await self.base_agent.summarize_node(state)
+        # 🚀 优化：最终步数以intermediate_steps为权威
+        try:
+            authoritative_step_count = len(getattr(final_state, 'intermediate_steps', []))
+            if authoritative_step_count > 0:
+                step_count = authoritative_step_count
+                logger.debug(f"📊 权威步数统计: {step_count} (基于intermediate_steps)")
+        except Exception as e:
+            logger.warning(f"⚠️ 权威步数统计失败: {e}")
         
-        return state
+        logger.info(f"🎯 执行完成，根图状态: {root_finished}, 最终步数: {step_count}")
+        return final_state, step_count
+    
+    # ===== 新的事件处理方法 - 参考myscalekb-agent =====
+    
+    async def _handle_chain_start_event(self, event: dict):
+        """处理链式调用开始事件 - 优化：减少冗余事件"""
+        event_name = event.get("name", "")
+        logger.debug(f"🔗 链式调用开始: {event_name}")
+        
+        # 🚀 优化：只发送关键节点的开始事件，减少冗余
+        if event_name == "planner":
+            await self._emit_event(self.current_event_builder.plan_started())
+        elif event_name == "summarize":
+            await self._emit_event(self.current_event_builder.summarize_started())
+        # bootstrap节点不再发送开始事件，减少冗余
+    
+    async def _handle_tool_start_event(self, event: dict):
+        """处理工具开始事件"""
+        tool_data = event.get("data", {})
+        tool_name = tool_data.get("name", "unknown_tool")
+        tool_input = tool_data.get("input", {})
+        
+        logger.debug(f"🔧 工具开始: {tool_name}")
+        await self._emit_event(self.current_event_builder.tool_started(
+            tool_name=tool_name,
+            tool_input=tool_input
+        ))
+    
+    async def _handle_tool_end_event(self, event: dict):
+        """处理工具结束事件"""
+        tool_data = event.get("data", {})
+        tool_name = tool_data.get("name", "unknown_tool")
+        tool_output = tool_data.get("output", "")
+        
+        logger.debug(f"✅ 工具完成: {tool_name}")
+        await self._emit_event(self.current_event_builder.tool_finished(
+            tool_name=tool_name,
+            tool_output=tool_output
+        ))
+    
+    async def _handle_model_start_event(self, event: dict):
+        """处理模型开始事件"""
+        logger.debug("🤖 模型开始生成")
+        await self._emit_event(self.current_event_builder.model_started())
+    
+    async def _handle_model_stream_event(self, event: dict):
+        """处理模型流事件"""
+        chunk_data = event.get("data", {})
+        chunk = chunk_data.get("chunk", {})
+        content = chunk.get("content", "")
+        
+        if content:
+            await self._emit_event(self.current_event_builder.model_streaming(content))
+    
+    async def _handle_model_end_event(self, event: dict):
+        """处理模型结束事件"""
+        logger.debug("🤖 模型生成完成")
+        await self._emit_event(self.current_event_builder.model_finished())
+    
+    async def _handle_chain_end_event(self, event: dict, current_state: AgentState) -> AgentState:
+        """处理链式调用结束事件 - 优化：减少冗余处理"""
+        event_name = event.get("name", "")
+        output_data = event.get("data", {}).get("output", {})
+        
+        logger.debug(f"🏁 链式调用结束: {event_name}")
+        
+        # 🚀 优化：只处理关键节点的结束事件
+        if event_name == "planner":
+            # 检查是否有下一步动作
+            has_next_action = bool(getattr(current_state, 'agent_outcome', None))
+            if hasattr(current_state, 'agent_outcome') and isinstance(current_state.agent_outcome, list):
+                has_next_action = len(current_state.agent_outcome) > 0
+                
+            await self._emit_event(self.current_event_builder.plan_decision({
+                "planning_completed": True,
+                "has_next_action": has_next_action,
+            }))
+            
+        elif event_name == "summarize":
+            # 从输出中获取总结
+            summary = "总结完成"
+            if isinstance(output_data, dict):
+                summary = output_data.get("output", summary)
+                if hasattr(output_data, "agent_outcome") and hasattr(output_data.agent_outcome, "return_values"):
+                    summary = output_data.agent_outcome.return_values.get("output", summary)
+            
+            await self._emit_event(self.current_event_builder.summarize_finished(summary=summary))
+        
+        # 更新状态
+        if isinstance(output_data, dict) and hasattr(current_state, '__dict__'):
+            for key, value in output_data.items():
+                if hasattr(current_state, key):
+                    setattr(current_state, key, value)
+        
+        return current_state
+    
+    # ===== 旧方法已移除 - 现在使用标准LangGraph事件 =====
     
     async def _emit_event(self, event: Event):
         """发送事件并记录日志"""
         if self.current_sink:
             await self.current_sink.emit(event)
-            logger.info(f"📤 实时事件: {event.type.value}")
+            logger.debug(f"📤 实时事件: {event.type.value}")
 
 
 class EventDrivenMasterAgentExecutor:
@@ -282,52 +350,6 @@ def create_event_driven_master_agent() -> tuple[EventDrivenMasterAgent, EventDri
     event_agent = EventDrivenMasterAgent(base_agent)
     executor = EventDrivenMasterAgentExecutor(base_agent)
     return event_agent, executor
-
-
-# 测试函数
-async def test_event_driven_agent():
-    """测试事件驱动Master Agent"""
-    print("🧪 测试事件驱动Master Agent...")
-    
-    # 创建事件驱动Agent
-    event_agent, executor = create_event_driven_master_agent()
-    
-    # 创建详细的事件接收器
-    class DetailedPrintSink:
-        async def emit(self, event):
-            now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            print(f"📡 [{now}] {event.type.value}")
-            
-            # 显示详细数据
-            if event.data:
-                for key, value in event.data.items():
-                    if key == 'tool_output' and isinstance(value, dict):
-                        if 'apikey' in value:
-                            print(f"    🔑 API密钥: {value['apikey']}")
-                        if 'message' in value:
-                            print(f"    💬 消息: {value['message']}")
-                    elif key == 'user_input':
-                        print(f"    👤 用户输入: {value}")
-                    elif key == 'phase':
-                        print(f"    📍 阶段: {value}")
-        
-        async def close(self):
-            pass
-    
-    sink = DetailedPrintSink()
-    
-    # 测试执行
-    result = await executor.run_with_events(
-        user_input="获取今天的API密钥",
-        session_id="test_event_driven_001",
-        sink=sink
-    )
-    
-    print(f"\n✅ 测试结果: {result}")
-
-
-if __name__ == "__main__":
-    asyncio.run(test_event_driven_agent())
 
 
 # 导出
