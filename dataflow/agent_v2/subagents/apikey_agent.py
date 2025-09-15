@@ -41,11 +41,20 @@ class APIKeyAgent(SubAgent):
     
     def __init__(self):
         # 硬编码的固定API密钥 - 方便测试验证
-
         self.secret_apikey = "123121323132"
         
         # 调用父类初始化
         super().__init__()
+    
+    @classmethod
+    def name(cls) -> str:
+        """返回代理名称"""
+        return "apikey_agent"
+    
+    @classmethod 
+    def description(cls) -> str:
+        """返回代理描述"""
+        return "API密钥获取代理，用于提供硬编码的测试API密钥"
     
     def state_definition(self) -> type[BaseModel]:
         """返回状态定义"""
@@ -89,7 +98,7 @@ class APIKeyAgent(SubAgent):
         return state_dict
     
     @entry
-    @node()
+    @node
     async def bootstrap(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """初始化阶段"""
         
@@ -102,7 +111,7 @@ class APIKeyAgent(SubAgent):
         })
         return state
     
-    @node()
+    @node
     async def validate_request(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """验证请求是否有效"""
         user_message = state.get("user_message", "").lower()
@@ -117,7 +126,7 @@ class APIKeyAgent(SubAgent):
         challenge_passed = state.get("challenge_passed", False)
         return "provide_apikey" if challenge_passed else "deny_access"
     
-    @node()
+    @node
     async def provide_apikey(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """提供API密钥"""
         import time
@@ -135,7 +144,7 @@ class APIKeyAgent(SubAgent):
         
         return state
     
-    @node()
+    @node
     async def deny_access(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """拒绝访问"""
         print(f"🔐 [APIKeyAgent] 拒绝访问，请求不符合要求")

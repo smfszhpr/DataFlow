@@ -222,10 +222,20 @@ class EventDrivenMasterAgent:
             await self._emit_event(self.current_event_builder.summarize_started())
         # bootstrap节点不再发送开始事件，减少冗余
     
+    async def _handle_tool_end_event(self, event: dict):
+        """处理工具结束事件"""
+        tool_data = event.get("data", {})
+        # 支持两种字段名：新版本用 'tool'，旧版本用 'name'
+        tool_name = tool_data.get("tool", tool_data.get("name", "unknown_tool"))
+        tool_output = tool_data.get("result", tool_data.get("output", {}))
+    
     async def _handle_tool_start_event(self, event: dict):
         """处理工具开始事件"""
+        # LangGraph 回调事件中，工具名称在顶级的 name 字段
+        tool_name = event.get("name", "unknown_tool")
+        
+        # 工具输入在 data.input 中
         tool_data = event.get("data", {})
-        tool_name = tool_data.get("name", "unknown_tool")
         tool_input = tool_data.get("input", {})
         
         logger.debug(f"🔧 工具开始: {tool_name}")
@@ -236,9 +246,12 @@ class EventDrivenMasterAgent:
     
     async def _handle_tool_end_event(self, event: dict):
         """处理工具结束事件"""
+        # LangGraph 回调事件中，工具名称在顶级的 name 字段
+        tool_name = event.get("name", "unknown_tool")
+        
+        # 工具输出在 data.output 中
         tool_data = event.get("data", {})
-        tool_name = tool_data.get("name", "unknown_tool")
-        tool_output = tool_data.get("output", "")
+        tool_output = tool_data.get("output", {})
         
         logger.debug(f"✅ 工具完成: {tool_name}")
         await self._emit_event(self.current_event_builder.tool_finished(

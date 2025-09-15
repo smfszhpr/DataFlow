@@ -37,12 +37,42 @@ class WebSocketSink(EventSink):
                     # 确保datetime正确序列化
                     event_data['timestamp'] = event.timestamp.isoformat()
                     
+                    # 简单处理：使用 json.dumps 的默认行为，只处理 AgentMetadata 对象
+                    event_data = self._clean_data(event_data)
+                    
                     await self.websocket.send_json(event_data)
                     logger.debug(f"📤 发送事件到 {self.session_id}: {event.type.value}")
         
         except Exception as e:
             logger.error(f"❌ WebSocket发送事件失败 {self.session_id}: {e}")
             self.closed = True
+    
+    def _clean_data(self, obj):
+        """简单清理数据，只处理已知的问题类型"""
+        if isinstance(obj, dict):
+            result = {}
+            for k, v in obj.items():
+                if k == 'agent_metadata' and hasattr(v, 'model_dump'):
+                    # 处理 Pydantic 模型
+                    metadata_dict = v.model_dump()
+                    if 'timestamp' in metadata_dict and hasattr(metadata_dict['timestamp'], 'isoformat'):
+                        metadata_dict['timestamp'] = metadata_dict['timestamp'].isoformat()
+                    result[k] = metadata_dict
+                elif isinstance(v, datetime):
+                    result[k] = v.isoformat()
+                elif isinstance(v, (dict, list)):
+                    result[k] = self._clean_data(v)
+                else:
+                    try:
+                        json.dumps(v)
+                        result[k] = v
+                    except (TypeError, ValueError):
+                        result[k] = str(v)
+            return result
+        elif isinstance(obj, list):
+            return [self._clean_data(item) for item in obj]
+        else:
+            return obj
     
     async def close(self) -> None:
         """关闭WebSocket连接"""
