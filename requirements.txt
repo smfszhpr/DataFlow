@@ -77,3 +77,5 @@ langchain-huggingface==0.1.2
 langchain-community==0.3.18
 langchain-deepseek==0.1.2
 langgraph==0.2.35
+
+originhub-myscalekb-agent-base==0.1.9
