@@ -3,7 +3,7 @@
 # 导入主要模块
 from .events import *
 from .websocket import *
-from .master.agent import create_master_agent, MasterAgent
+from .master.agent import MasterAgent
 
 __all__ = [
     # Events
@@ -16,5 +16,5 @@ __all__ = [
     'connection_manager', 'event_router', 'app', 'start_websocket_server',
     
     # Master Agent
-    'MasterAgent', 'create_master_agent'
+    'MasterAgent'
 ]

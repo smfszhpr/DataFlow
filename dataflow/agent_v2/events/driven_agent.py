@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 from .core import EventSink, Event, EventBuilder, EventType
-from ..master.agent import MasterAgent, AgentState, create_master_agent
+from ..master.agent import MasterAgent, AgentState
 from langchain.schema import AgentAction, AgentFinish
 
 logger = logging.getLogger(__name__)
@@ -364,7 +364,7 @@ class EventDrivenMasterAgentExecutor:
 
 def create_event_driven_master_agent() -> tuple[EventDrivenMasterAgent, EventDrivenMasterAgentExecutor]:
     """创建事件驱动的Master Agent"""
-    base_agent, _ = create_master_agent()
+    base_agent = MasterAgent()
     event_agent = EventDrivenMasterAgent(base_agent)
     executor = EventDrivenMasterAgentExecutor(base_agent)
     return event_agent, executor

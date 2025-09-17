@@ -17,7 +17,6 @@ import uvicorn
 from ..events import EventBuilder, PrintSink, CompositeSink
 from .events import connection_manager, event_router, WebSocketSink
 from ..events import create_event_driven_master_agent, EventDrivenMasterAgentExecutor
-from ..master.agent import create_master_agent
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
