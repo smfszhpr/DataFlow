@@ -1,22 +1,17 @@
 """
-Former Agent V2 模块
-提供表单生成和XML配置功能
+Former模块 - 智能表单生成和用户交互
+
+主要功能：
+1. 分析用户需求，确定合适的任务类型
+2. 根据模板智能生成和填充表单
+3. 处理用户交互和表单修改
+4. 提交表单到对应的工作流
 """
 
-from .agent import FormerAgentV2
-from .compat import FormerAgentCompat, FormRequest, FormResponse
-from .tools import RequirementAnalysis, FieldValidation, XMLGeneration
-
-# 为了与master agent兼容，导出兼容层
-FormerAgent = FormerAgentCompat
+from .form_analyzer import FormAnalyzer
+from .form_generator import FormGenerator
 
 __all__ = [
-    'FormerAgentV2',
-    'FormerAgent', 
-    'FormerAgentCompat',
-    'FormRequest',
-    'FormResponse',
-    'RequirementAnalysis',
-    'FieldValidation', 
-    'XMLGeneration'
+    'FormAnalyzer', 
+    'FormGenerator'
 ]

@@ -34,7 +34,8 @@ class EventDrivenMasterAgent:
         user_input: str,
         session_id: str,
         sink: EventSink,
-        conversation_history: Optional[List[Dict[str, str]]] = None
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        initial_state: Optional[Dict[str, Any]] = None  # 🔥 新增：支持初始状态
     ) -> Dict[str, Any]:
         """执行用户请求并推送实时事件"""
         
@@ -55,13 +56,35 @@ class EventDrivenMasterAgent:
             
             conversation_history = self.conversation_sessions[session_id]
             
-            # 初始化状态
-            state = AgentState(
-                input=user_input,
-                intermediate_steps=[],
-                conversation_history=conversation_history.copy(),
-                session_id=session_id
-            )
+            # 🔥 新增：智能状态初始化 - 支持传递的初始状态
+            if initial_state:
+                logger.info(f"🔍 EventDriven调试 - 接收到初始状态，keys: {list(initial_state.keys())}")
+                # 使用传递的初始状态，但确保必要字段存在
+                state_data = {
+                    "input": user_input,
+                    "intermediate_steps": [],
+                    "conversation_history": conversation_history.copy(),
+                    "session_id": session_id
+                }
+                # 合并初始状态中的其他字段
+                for key, value in initial_state.items():
+                    if key not in ["input", "session_id"]:  # 不覆盖基础字段
+                        state_data[key] = value
+                        logger.info(f"🔍 EventDriven调试 - 添加状态字段: {key}")
+                
+                if "form_session" in initial_state:
+                    logger.info(f"🔍 EventDriven调试 - form_session内容: {initial_state['form_session']}")
+                
+                state = AgentState(**state_data)
+            else:
+                # 默认初始化状态
+                logger.info(f"🔍 EventDriven调试 - 使用默认初始状态")
+                state = AgentState(
+                    input=user_input,
+                    intermediate_steps=[],
+                    conversation_history=conversation_history.copy(),
+                    session_id=session_id
+                )
             
             # 发送初始化完成事件
             await self._emit_event(self.current_event_builder.state_update({
@@ -123,10 +146,12 @@ class EventDrivenMasterAgent:
             logger.error(f"❌ {error_msg}")
             logger.error(f"错误详情:\n{traceback.format_exc()}")
             
-            await self._emit_event(self.current_event_builder.run_error(
-                error=error_msg,
-                session_id=session_id
-            ))
+            # 确保event_builder存在再发送错误事件
+            if self.current_event_builder:
+                await self._emit_event(self.current_event_builder.run_error(
+                    error=error_msg,
+                    session_id=session_id
+                ))
             
             return {
                 "success": False,
@@ -297,10 +322,12 @@ class EventDrivenMasterAgent:
             if isinstance(agent_outcome, list):
                 has_next_action = len(agent_outcome) > 0
                 
-            await self._emit_event(self.current_event_builder.plan_decision({
-                "planning_completed": True,
-                "has_next_action": has_next_action,
-            }))
+            # 确保event_builder存在再发送事件
+            if self.current_event_builder:
+                await self._emit_event(self.current_event_builder.plan_decision({
+                    "planning_completed": True,
+                    "has_next_action": has_next_action,
+                }))
             
         elif event_name == "summarize":
             # 从输出中获取总结
@@ -351,14 +378,16 @@ class EventDrivenMasterAgentExecutor:
         user_input: str,
         session_id: str,
         sink: EventSink,
-        conversation_history: Optional[List[Dict[str, str]]] = None
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        initial_state: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """带事件推送的执行方法"""
         return await self.event_agent.execute_with_events(
             user_input=user_input,
             session_id=session_id,
             sink=sink,
-            conversation_history=conversation_history
+            conversation_history=conversation_history,
+            initial_state=initial_state
         )
 
 

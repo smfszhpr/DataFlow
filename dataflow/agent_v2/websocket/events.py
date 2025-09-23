@@ -181,6 +181,23 @@ class WebSocketEventRouter:
                     # 异步执行处理器，避免阻塞WebSocket接收循环
                     asyncio.create_task(handler(user_input, session_id))
             
+            elif msg_type == "continue_chat_response":
+                # 处理 Continue Chat 工具的用户响应
+                if "continue_chat_response" in self.handlers:
+                    handler = self.handlers["continue_chat_response"]
+                    # 异步执行处理器
+                    asyncio.create_task(handler(message, session_id))
+                else:
+                    logger.warning("⚠️ continue_chat_response 处理器未注册")
+            
+            elif msg_type == "form_state_update":
+                # 🎯 处理前端表单状态更新（简化版）
+                if "form_state_update_handler" in self.handlers:
+                    handler = self.handlers["form_state_update_handler"]
+                    asyncio.create_task(handler(message, session_id))
+                else:
+                    logger.warning("⚠️ form_state_update_handler 处理器未注册")
+            
             else:
                 logger.warning(f"⚠️ 未知消息类型: {msg_type}")
         

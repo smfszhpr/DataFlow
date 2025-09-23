@@ -8,13 +8,14 @@ import asyncio
 import logging
 from typing import Dict, Any, Optional
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-from ..events import EventBuilder, PrintSink, CompositeSink
+from ..events import EventBuilder, PrintSink, CompositeSink, Event, EventType
 from .events import connection_manager, event_router, WebSocketSink
 from ..events import create_event_driven_master_agent, EventDrivenMasterAgentExecutor
 
@@ -38,27 +39,216 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 全局执行器
+# 全局执行器和状态同步
 event_executor: Optional[EventDrivenMasterAgentExecutor] = None
+form_state_sync_timer = None
+
+# 全局状态存储 (简化版的Master Agent state同步)
+global_agent_states = {}
+
+# 🔥 新增：表单状态历史，用于检测变化
+form_state_history = {}
 
 
 @app.on_event("startup")
 async def startup_event():
     """应用启动时初始化"""
-    global event_executor
+    global event_executor, form_state_sync_timer
     
     try:
         # 创建事件驱动的Master Agent
         event_agent, event_executor = create_event_driven_master_agent()
         
-        # 注册用户输入处理器
+        # 🎯 注册表单状态更新处理器
+        async def handle_form_state_update(message: dict, session_id: str):
+            """处理前端表单状态更新"""
+            try:
+                # 获取Master Agent状态
+                agent_state = global_agent_states.get(session_id)
+                if not agent_state:
+                    logger.warning(f"⚠️ 会话 {session_id} 的Agent状态未找到")
+                    return
+                
+                # 确保form_session存在
+                if not hasattr(agent_state, 'form_session') or not agent_state.form_session:
+                    logger.warning(f"⚠️ 会话 {session_id} 的form_session未找到")
+                    return
+                
+                # 更新表单数据
+                form_data = message.get('form_data', {})
+                if 'fields' in form_data:
+                    if not hasattr(agent_state.form_session, 'form_data'):
+                        agent_state.form_session.form_data = {'fields': {}}
+                    elif not agent_state.form_session.form_data:
+                        agent_state.form_session.form_data = {'fields': {}}
+                    elif 'fields' not in agent_state.form_session.form_data:
+                        agent_state.form_session.form_data['fields'] = {}
+                    
+                    # 更新字段
+                    agent_state.form_session.form_data['fields'].update(form_data['fields'])
+                
+                # 更新时间戳
+                agent_state.form_session.updated_at = datetime.now().isoformat()
+                
+                logger.info(f"✅ 表单状态已更新: {session_id}")
+                
+            except Exception as e:
+                logger.error(f"❌ 处理表单状态更新失败: {e}")
+        
+        # 注册处理器
+        event_router.register_handler("form_state_update_handler", handle_form_state_update)
         event_router.register_handler("user_input_handler", handle_user_input)
+        
+        # 启动状态同步定时器
+        form_state_sync_timer = asyncio.create_task(form_state_sync_loop())
         
         logger.info("🚀 DataFlow WebSocket服务器启动成功")
         
     except Exception as e:
-        logger.error(f"❌ 服务器启动失败: {e}")
+        import traceback
+        error_msg = f"❌ 服务器启动失败: {e}"
+        logger.error(error_msg)
+        logger.error(f"❌ 详细错误信息:\n{traceback.format_exc()}")
         raise
+
+
+async def form_state_sync_loop():
+    """表单状态同步循环 - 每2秒同步一次"""
+    while True:
+        try:
+            await asyncio.sleep(2)  # 每2秒同步一次
+            await sync_form_states_to_clients()
+        except Exception as e:
+            logger.error(f"❌ 表单状态同步失败: {e}")
+
+
+async def sync_form_states_to_clients():
+    """同步表单状态到所有客户端（智能检测变化）"""
+    if not global_agent_states:
+        return
+    
+    # 获取所有活跃连接
+    active_sessions = connection_manager.get_active_sessions()
+    
+    for session_id in active_sessions:
+        if session_id in global_agent_states:
+            state = global_agent_states[session_id]
+            
+            # 🎯 修复：处理不同的状态结构
+            form_session = None
+            if isinstance(state, dict):
+                form_session = state.get("form_session", {})
+                logger.debug(f"🔍 从dict state提取form_session: {form_session}")
+                # 🔥 新增：如果AgentState中有tool_results，提取former的missing_params
+                if "tool_results" in state:
+                    logger.debug(f"🔍 检查tool_results，数量: {len(state['tool_results'])}")
+                    for tool_result in state["tool_results"]:
+                        if tool_result.get("tool") == "former" and tool_result.get("payload"):
+                            payload = tool_result["payload"]
+                            logger.debug(f"🔍 发现former工具结果，payload keys: {list(payload.keys())}")
+                            if payload.get("missing_params"):
+                                if not form_session:
+                                    form_session = {}
+                                form_session["missing_params"] = payload["missing_params"]
+                                logger.debug(f"🔍 添加missing_params: {payload['missing_params']}")
+                            if payload.get("extracted_params"):
+                                if not form_session:
+                                    form_session = {}
+                                form_session["extracted_params"] = payload["extracted_params"]
+                                logger.debug(f"🔍 添加extracted_params: {payload['extracted_params']}")
+                            if payload.get("form_stage"):
+                                if not form_session:
+                                    form_session = {}
+                                form_session["form_stage"] = payload["form_stage"]
+                            logger.debug(f"🔍 更新后的form_session: {form_session}")
+            elif hasattr(state, 'form_session'):
+                # 如果是Agent状态对象
+                form_session = {
+                    "form_data": getattr(state.form_session, 'form_data', {"fields": {}}) if state.form_session else {"fields": {}},
+                    "form_stage": getattr(state.form_session, 'form_stage', 'initial') if state.form_session else 'initial',
+                    "updated_at": getattr(state.form_session, 'updated_at', datetime.now().isoformat()) if state.form_session else datetime.now().isoformat()
+                }
+                # 🔥 新增：提取missing_params
+                if hasattr(state, 'tool_results'):
+                    for tool_result in state.tool_results:
+                        if tool_result.get("tool") == "former" and tool_result.get("payload"):
+                            payload = tool_result["payload"]
+                            if payload.get("missing_params"):
+                                form_session["missing_params"] = payload["missing_params"]
+                            if payload.get("extracted_params"):
+                                form_session["extracted_params"] = payload["extracted_params"]
+            
+            # 🔥 新增：检测表单状态是否有实际变化
+            if form_session:
+                # 生成状态摘要用于比较
+                current_state_summary = {
+                    "missing_params": form_session.get("missing_params", []),
+                    "extracted_params": form_session.get("extracted_params", {}),
+                    "form_data": form_session.get("form_data", {"fields": {}}),
+                    "form_stage": form_session.get("form_stage", "initial")
+                }
+                
+                # 检查是否与历史状态相同
+                if session_id in form_state_history:
+                    last_state = form_state_history[session_id]
+                    if current_state_summary == last_state:
+                        logger.debug(f"🔍 会话 {session_id} 表单状态无变化，跳过同步")
+                        continue
+                
+                # 更新历史状态
+                form_state_history[session_id] = current_state_summary
+                
+                logger.debug(f"🔍 发送表单状态同步到会话: {session_id}")
+                
+                # 发送表单状态更新事件
+                ws_sink = await connection_manager.get_connection(session_id)
+                if ws_sink:
+                    try:
+                        await ws_sink.emit(Event(
+                            type=EventType.STATE_UPDATE,
+                            session_id=session_id,
+                            timestamp=datetime.now(),
+                            data={
+                                "type": "form_state_sync",
+                                "form_session": form_session
+                            }
+                        ))
+                        logger.debug(f"🔄 表单状态已同步: {session_id}")
+                    except Exception as e:
+                        logger.error(f"❌ 发送表单状态失败 {session_id}: {e}")
+
+
+async def handle_form_state_update(message: Dict[str, Any], session_id: str):
+    """处理前端表单状态更新（简化版）"""
+    try:
+        # 获取表单数据更新
+        form_data = message.get("form_data", {})
+        
+        # 更新全局状态
+        if session_id not in global_agent_states:
+            global_agent_states[session_id] = {}
+        
+        if "form_session" not in global_agent_states[session_id]:
+            global_agent_states[session_id]["form_session"] = {}
+        
+        # 更新表单数据
+        global_agent_states[session_id]["form_session"]["form_data"] = form_data
+        global_agent_states[session_id]["form_session"]["updated_at"] = datetime.now().isoformat()
+        
+        # 🔥 新增：同时更新历史状态，防止同步循环立即覆盖
+        current_form_session = global_agent_states[session_id]["form_session"]
+        updated_state_summary = {
+            "missing_params": current_form_session.get("missing_params", []),
+            "extracted_params": current_form_session.get("extracted_params", {}),
+            "form_data": form_data,
+            "form_stage": current_form_session.get("form_stage", "initial")
+        }
+        form_state_history[session_id] = updated_state_summary
+        
+        logger.debug(f"✅ 表单状态更新完成: {session_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ 处理表单状态更新失败 {session_id}: {e}")
 
 
 async def handle_user_input(user_input: str, session_id: str):
@@ -80,23 +270,129 @@ async def handle_user_input(user_input: str, session_id: str):
         print_sink = PrintSink(f"🎭[{session_id[:8]}]")
         composite_sink = CompositeSink([ws_sink, print_sink])
         
-        logger.debug(f"🎯 开始处理用户输入: {user_input} (会话: {session_id})")
+        logger.info(f"🎯 开始处理用户输入: {user_input} (会话: {session_id})")
         
-        # 执行Agent
-        result = await event_executor.run_with_events(
-            user_input=user_input,
-            session_id=session_id,
-            sink=composite_sink
-        )
+        # 🔥 调试：检查全局状态
+        logger.info(f"🔍 WebSocket调试 - global_agent_states中的会话: {list(global_agent_states.keys())}")
+        logger.info(f"🔍 WebSocket调试 - 当前会话ID: {session_id}")
+        logger.info(f"🔍 WebSocket调试 - 会话存在检查: {session_id in global_agent_states}")
         
-        logger.debug(f"✅ 用户输入处理完成: {session_id}")
+        # 🔥 新增：构建初始状态，包含现有的表单状态
+        initial_state = {
+            "input": user_input,
+            "session_id": session_id
+        }
+        
+        # 检查是否有现有的agent状态（包括表单状态）
+        if session_id in global_agent_states:
+            existing_state = global_agent_states[session_id]
+            logger.info(f"🔄 发现会话 {session_id} 的现有状态，keys: {list(existing_state.keys())}")
+            
+            # 传递现有的表单状态
+            if "form_session" in existing_state:
+                initial_state["form_session"] = existing_state["form_session"]
+                form_data = existing_state["form_session"].get("form_data", {})
+                logger.info(f"🔍 WebSocket调试 - form_session结构: {existing_state['form_session']}")
+                if form_data:
+                    if isinstance(form_data, dict) and "fields" in form_data:
+                        logger.info(f"🔄 传递现有表单数据: {list(form_data['fields'].keys())}")
+                        logger.info(f"🔄 表单字段值: {form_data['fields']}")
+                    else:
+                        logger.info(f"🔄 表单数据结构: {form_data}")
+                else:
+                    logger.info(f"🔄 表单会话存在但form_data为空")
+            else:
+                logger.info(f"🔄 现有状态中无form_session")
+            
+            # 传递其他相关状态
+            for key in ["current_workflow_id", "tool_results"]:
+                if key in existing_state:
+                    initial_state[key] = existing_state[key]
+        else:
+            logger.info(f"🔄 会话 {session_id} 无现有状态，从空白开始")
+            # 🎯 确保全局状态中有该会话的初始状态
+            global_agent_states[session_id] = {
+                "form_session": {
+                    "form_data": {"fields": {}},
+                    "form_stage": "initial",
+                    "updated_at": datetime.now().isoformat()
+                },
+                "current_workflow_id": None,
+                "session_id": session_id
+            }
+            logger.info(f"✅ 初始化会话状态: {session_id}")
+        
+        # 执行Agent（需要修改executor以支持initial_state）
+        try:
+            result = await event_executor.run_with_events(
+                user_input=user_input,
+                session_id=session_id,
+                sink=composite_sink,
+                initial_state=initial_state  # 🔥 传递初始状态
+            )
+        except TypeError:
+            # 如果executor不支持initial_state，使用原始方法
+            logger.warning("⚠️ Executor不支持initial_state参数，使用原始调用方式")
+            result = await event_executor.run_with_events(
+                user_input=user_input,
+                session_id=session_id,
+                sink=composite_sink
+            )
+        
+        # 🎯 更新全局状态 - 从executor结果中提取完整的AgentState
+        if result:
+            logger.info(f"🔍 Agent执行结果类型: {type(result)}")
+            
+            # 尝试获取AgentState数据
+            agent_state_data = None
+            if hasattr(result, 'agent_state'):
+                agent_state_data = result.agent_state
+            elif hasattr(result, 'state'):
+                agent_state_data = result.state
+            elif isinstance(result, dict):
+                agent_state_data = result
+            
+            logger.info(f"🔍 提取的agent_state_data类型: {type(agent_state_data)}")
+            
+            if agent_state_data:
+                # 更新global_agent_states以包含完整的AgentState数据
+                if isinstance(agent_state_data, dict):
+                    # 如果是字典，直接更新
+                    global_agent_states[session_id].update(agent_state_data)
+                    logger.info(f"🔍 更新了global_agent_states[{session_id}]，keys: {list(global_agent_states[session_id].keys())}")
+                else:
+                    # 如果是对象，提取所需属性
+                    if hasattr(agent_state_data, 'form_session'):
+                        global_agent_states[session_id]["form_session"] = {
+                            "form_data": getattr(agent_state_data.form_session, 'form_data', {"fields": {}}),
+                            "form_stage": getattr(agent_state_data.form_session, 'form_stage', 'processing'),
+                            "updated_at": datetime.now().isoformat()
+                        }
+                    
+                    if hasattr(agent_state_data, 'current_workflow_id'):
+                        global_agent_states[session_id]["current_workflow_id"] = agent_state_data.current_workflow_id
+                    
+                    if hasattr(agent_state_data, 'tool_results'):
+                        global_agent_states[session_id]["tool_results"] = agent_state_data.tool_results
+                        logger.info(f"🔍 保存了tool_results，数量: {len(agent_state_data.tool_results)}")
+            else:
+                logger.warning(f"⚠️ 无法从result中提取agent_state_data")
+        
+        logger.info(f"✅ 用户输入处理完成: {session_id}")
         
     except Exception as e:
-        logger.error(f"❌ 处理用户输入失败 {session_id}: {e}")
+        import traceback
+        error_msg = f"❌ 处理用户输入失败 {session_id}: {e}"
+        logger.error(error_msg)
+        logger.error(f"❌ 详细错误信息:\n{traceback.format_exc()}")
         # 发送错误事件
+        ws_sink = await connection_manager.get_connection(session_id)
         if ws_sink:
             event_builder = EventBuilder(session_id)
             await ws_sink.emit(event_builder.run_error(f"处理失败: {str(e)}"))
+
+
+
 
 
 @app.websocket("/ws/agent/{session_id}")
@@ -154,158 +450,28 @@ async def websocket_agent_endpoint(websocket: WebSocket, session_id: str):
 @app.get("/")
 async def root():
     """根路径 - 返回简单的测试页面"""
-    return HTMLResponse(content="""
-<!DOCTYPE html>
+    # 读取HTML模板文件
+    html_file_path = Path(__file__).parent / "templates" / "test.html"
+    try:
+        with open(html_file_path, 'r', encoding='utf-8') as f:
+            html_content = f.read()
+        return HTMLResponse(content=html_content)
+    except FileNotFoundError:
+        return HTMLResponse(content="""
 <html>
-<head>
-    <title>DataFlow Agent WebSocket Test</title>
-    <meta charset="utf-8">
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        .event { margin: 5px 0; padding: 8px; background: #f5f5f5; border-radius: 4px; font-family: monospace; white-space: pre-wrap; word-wrap: break-word; }
-        .event.run_started { background: #e8f5e8; border-left: 4px solid #4caf50; }
-        .event.tool_started { background: #e3f2fd; border-left: 4px solid #2196f3; }
-        .event.tool_finished { background: #e8f5e8; border-left: 4px solid #4caf50; }
-        .event.plan_decision { background: #fff3e0; border-left: 4px solid #ff9800; }
-        .event.summarize_finished { background: #f3e5f5; border-left: 4px solid #9c27b0; }
-        .event.run_finished { background: #e8f5e8; border-left: 4px solid #4caf50; font-weight: bold; }
-        .event.state_update { background: #f0f0f0; border-left: 4px solid #607d8b; }
-        .event.error, .event.run_error { background: #ffebee; border-left: 4px solid #f44336; }
-        .event.user_input { background: #e1f5fe; border-left: 4px solid #00bcd4; }
-        input, button { padding: 10px; margin: 5px; }
-        #input { width: 400px; }
-        #events { height: 500px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; }
-    </style>
-</head>
 <body>
-    <div class="container">
-        <h1>🤖 DataFlow Agent WebSocket 测试</h1>
-        <p><strong>连接状态:</strong> <span id="status">未连接</span></p>
-        
-        <div>
-            <input type="text" id="input" placeholder="输入您的问题..." />
-            <button onclick="sendMessage()">发送</button>
-            <button onclick="clearEvents()">清除</button>
-        </div>
-        
-        <h3>📡 实时事件:</h3>
-        <div id="events"></div>
-    </div>
-
-    <script>
-        let ws = null;
-        const sessionId = 'test_' + Math.random().toString(36).substr(2, 9);
-        
-        function connect() {
-            ws = new WebSocket(`ws://localhost:8000/ws/agent/${sessionId}`);
-            
-            ws.onopen = function(event) {
-                document.getElementById('status').textContent = '已连接';
-                document.getElementById('status').style.color = 'green';
-                addEvent('system', '🔗 WebSocket连接成功');
-            };
-            
-            ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                addEvent(data.type, formatEvent(data));
-            };
-            
-            ws.onclose = function(event) {
-                document.getElementById('status').textContent = '连接断开';
-                document.getElementById('status').style.color = 'red';
-                addEvent('system', '🔌 WebSocket连接断开');
-            };
-            
-            ws.onerror = function(error) {
-                addEvent('error', '❌ 连接错误: ' + error);
-            };
-        }
-        
-        function sendMessage() {
-            const input = document.getElementById('input');
-            if (ws && input.value.trim()) {
-                ws.send(JSON.stringify({
-                    type: 'user_input',
-                    input: input.value.trim()
-                }));
-                addEvent('user_input', '👤 ' + input.value);
-                input.value = '';
-            }
-        }
-        
-        function formatEvent(data) {
-            const time = new Date(data.timestamp).toLocaleTimeString();
-            let content = `[${time}] ${data.type}`;
-            
-            if (data.data) {
-                // 根据事件类型格式化详细信息
-                if (data.type === 'tool_started') {
-                    content += ` - 开始执行: ${data.data.tool_name}`;
-                    if (data.data.tool_input) {
-                        const input = JSON.stringify(data.data.tool_input);
-                        content += ` | 输入: ${input}`;
-                    }
-                } else if (data.type === 'tool_finished') {
-                    content += ` - 完成: ${data.data.tool_name}`;
-                    if (data.data.tool_output) {
-                        const output = data.data.tool_output;
-                        if (output.apikey) {
-                            content += ` | API密钥: ${output.apikey}`;
-                        }
-                        if (output.result) {
-                            content += ` | 结果: ${output.result}`;
-                        }
-                        if (output.message) {
-                            content += ` | 消息: ${output.message}`;
-                        }
-                    }
-                } else if (data.type === 'plan_decision') {
-                    content += ` - 决策: ${JSON.stringify(data.data.decision || data.data)}`;
-                } else if (data.type === 'summarize_finished') {
-                    content += ` - 总结完成`;
-                    if (data.data.summary) {
-                        content += ` | ${data.data.summary}`;
-                    }
-                } else if (data.type === 'run_finished') {
-                    content += ' - 执行完成';
-                    if (data.data.result) {
-                        content += ` | 最终结果: ${data.data.result}`;
-                    }
-                } else if (data.type === 'state_update') {
-                    content += ` - 状态: ${data.data.state_info?.phase || data.data.phase || '未知'}`;
-                }
-            }
-            
-            return content;
-        }
-        
-        function addEvent(type, content) {
-            const events = document.getElementById('events');
-            const div = document.createElement('div');
-            div.className = `event ${type}`;
-            div.textContent = content;
-            events.appendChild(div);
-            events.scrollTop = events.scrollHeight;
-        }
-        
-        function clearEvents() {
-            document.getElementById('events').innerHTML = '';
-        }
-        
-        // 自动连接
-        connect();
-        
-        // 回车发送
-        document.getElementById('input').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                sendMessage();
-            }
-        });
-    </script>
+<h1>DataFlow Agent WebSocket Server</h1>
+<p>HTML模板文件未找到。请确保 templates/test.html 文件存在。</p>
+<p>WebSocket端点: <code>ws://localhost:8000/ws/agent/{session_id}</code></p>
 </body>
 </html>
-    """)
+        """)
+
+
+@app.get("/test")
+async def test_page():
+    """测试页面 - 和根路径相同"""
+    return await root()
 
 
 @app.get("/api/health")

@@ -6,6 +6,7 @@ import logging
 import asyncio
 import time
 import uuid
+import json
 from typing import Dict, List, Any, Union, Optional, Tuple, TypedDict, Annotated
 from pydantic import BaseModel
 from enum import Enum
@@ -32,8 +33,11 @@ from ..events.core import EventSink, Event, EventType
 
 from dataflow.agent_v2.llm_client import get_llm_client
 from dataflow.agent_v2.subagents.apikey_agent import APIKeyTool
-from dataflow.agent_v2.subagents.mock_tools import SleepTool, MockSearchTool, MockFormerTool, MockCodeGenTool
+from dataflow.agent_v2.subagents.mock_tools import SleepTool
 from dataflow.agent_v2.subagents.csvtools import CSVProfileTool, CSVDetectTimeColumnsTool, CSVVegaSpecTool, ASTStaticCheckTool, UnitTestStubTool, LocalIndexBuildTool, LocalIndexQueryTool
+from dataflow.agent_v2.former.former_tool import FormerTool
+from dataflow.agent_v2.subagents.code_workflow_tool import CodeWorkflowTool
+from dataflow.agent_v2.subagents.continue_chat_tool import ContinueChatTool
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -41,8 +45,14 @@ def to_langchain_tool(tool: BaseTool) -> StructuredTool:
     ArgsSchema = tool.params()  # 你的工具已经提供了 Pydantic 参数类
 
     async def _arun(**kwargs):
-        # 交给原工具执行（确保是 async）
-        return await tool.execute(**kwargs)
+        # 对于Former工具，特殊处理参数转换
+        if tool.name() == "former":
+            from dataflow.agent_v2.former.former_tool import FormerToolParams
+            params = FormerToolParams(**kwargs)
+            return tool.execute(params)  # FormerTool是同步的
+        else:
+            # 其他工具正常处理
+            return await tool.execute(**kwargs)
 
     return StructuredTool.from_function(
         coroutine=_arun,                      # 异步函数
@@ -51,17 +61,6 @@ def to_langchain_tool(tool: BaseTool) -> StructuredTool:
         args_schema=ArgsSchema,               # 参数校验
         return_direct=False,                  # 常规情况 False；需要时可 True
     )
-
-
-def new_step_id() -> str:
-    return f"step-{uuid.uuid4().hex[:8]}"
-
-
-class PlannerOutput(BaseModel):
-    decision: str              # "continue" | "finish"
-    next_actions: list = []    # [ {"tool": "...", "tool_input": {...}} ... ]
-    user_message: Optional[str] = None
-    reasons: Optional[str] = None
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +81,13 @@ class AgentState(TypedDict, total=False):
     session_id: Optional[str]
     current_step: str
     form_data: Optional[Dict[str, Any]]
+    form_session: Optional[Dict[str, Any]]  # FormerTool表单会话状态，统一存储到Master Agent
     xml_content: Optional[str]
+    
+    # Former工具跳转控制字段
+    next_tool_instruction: Optional[str]  # former工具指定的下一个工具
+    force_summary: Optional[bool]  # 是否强制跳转到summary
+    tool_routing_reason: Optional[str]  # 跳转原因说明
     execution_result: Optional[str]
     conversation_history: List[Dict[str, str]]  # 对话历史
     last_tool_results: Optional[Dict[str, Any]]  # 最近的工具结果
@@ -96,47 +101,33 @@ class AgentState(TypedDict, total=False):
     next_action: Optional[str]  # 下一个动作决策
 
 
-class ActionType(Enum):
-    """动作类型"""
-    TOOL_EXECUTION = "tool_execution"
-    SUB_AGENT_FORWARD = "sub_agent_forward"
-    GENERAL_CONVERSATION = "general_conversation"
-    END = "end"
-
-
 class MasterAgent(SubAgent):
     """DataFlow Master Agent - 基于 MyScaleKB-Agent 风格的 LangGraph 架构"""
     
     def __init__(self, ctx=None, llm=None, memory=None, *args, **kwargs):
-        # 如果没有传入 llm，创建一个模拟的 llm 对象
+        # 🔧 修复：如果llm为None，创建默认的LLM客户端
         if llm is None:
             class MockLLM:
                 def __init__(self):
                     self.model = get_llm_client()
             llm = MockLLM()
         
-        # 如果没有传入 ctx，创建一个模拟的 ctx 对象
-        if ctx is None:
-            class MockContext:
-                def __init__(self):
-                    self.embedding_model = None
-                    self.myscale_client = None
-                    self.variables = {"knowledge_scopes": []}
-            ctx = MockContext()
+        # 确保self.llm在super().__init__之前被设置
+        self.llm = llm
         
-        # 如果没有传入 memory，创建一个模拟的 memory 对象
-        if memory is None:
-            class MockMemory:
-                pass
-            memory = MockMemory()
-        
-        super().__init__(ctx, llm, memory, *args, **kwargs)
-        
+        try:
+            super().__init__(ctx, llm, memory, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"❌ SubAgent初始化失败: {e}")
+            # 如果SubAgent初始化失败，我们手动设置必要的属性
+            self.ctx = ctx
+            self.memory = memory
+
         self.forward_paths = {}
         self.sub_agents = {}
         self.conversation_sessions = {}  # 会话管理
         self.tools = []
-        
+
         # 注册工具
         self._register_tools()
     
@@ -151,13 +142,14 @@ class MasterAgent(SubAgent):
     def _register_tools(self):
         """注册工具"""
         try:
+            # 导入Former工具（从former文件夹）
             self.tools = [
                 APIKeyTool(),
-                # 添加Mock工具用于测试多轮编排
+                # 主要工作流工具
+                FormerTool(),
+                CodeWorkflowTool(),
+                # 其他Mock工具用于测试多轮编排
                 SleepTool(),
-                MockSearchTool(),
-                MockFormerTool(),
-                MockCodeGenTool(),
                 CSVProfileTool(), 
                 CSVDetectTimeColumnsTool(), 
                 CSVVegaSpecTool(), 
@@ -165,50 +157,54 @@ class MasterAgent(SubAgent):
                 UnitTestStubTool(), 
                 LocalIndexBuildTool(), 
                 LocalIndexQueryTool()
-
             ]
-            logger.info(f"已注册 {len(self.tools)} 个工具")
+            
+            logger.info(f"已注册 {len(self.tools)} 个可直接调用的工具")
+            
         except Exception as e:
             logger.error(f"工具注册失败: {e}")
             self.tools = []
         
-        self.lc_tools = [to_langchain_tool(t) for t in self.tools]
-        self.tool_executor = ToolExecutor(self.lc_tools)
-    
+        # 确保 lc_tools 总是被设置
+        self.lc_tools = [to_langchain_tool(t) for t in (self.tools or [])]
+        
+        # 初始化工具执行器
+        try:
+            self.tool_executor = ToolExecutor(self.lc_tools)
+        except Exception as e:
+            logger.error(f"ToolExecutor初始化失败: {e}")
+            self.tool_executor = None
+
     def build_app(self):
         """构建代理工作流 - 类似 MyScaleKB-Agent 的实现"""
         workflow = self._build_graph(AgentState, compiled=False)
         
-        # 设置条件入口点
+        # 设置条件入口点 - 直接进入planner，统一决策逻辑
         workflow.set_conditional_entry_point(
             self.entry,
             {
-                "bootstrap": "bootstrap",
+                "planner": "planner",
             }
         )
         
         # 添加条件边
         workflow.add_conditional_edges(
-            "bootstrap",
-            self.action_forward,
-            {
-                "execute_tools": "execute_tools",
-                "general_conversation": "general_conversation", 
-                "end": "summarize"
-            }
-        )
-        
-        # 执行工具后进入规划器进行下一轮决策
-        workflow.add_edge("execute_tools", "planner")
-        workflow.add_edge("general_conversation", "planner")
-        
-        # 规划器决定继续执行还是结束
-        workflow.add_conditional_edges(
             "planner",
             self.planner_router,
             {
-                "continue": "execute_tools",  # 继续执行更多工具
-                "finish": "summarize"        # 完成任务
+                "continue": "execute_tools",
+                "finish": "summarize"
+            }
+        )
+        
+        # 🔥 关键修复：execute_tools 使用条件边而不是固定边
+        workflow.add_conditional_edges(
+            "execute_tools",
+            self.action_forward,
+            {
+                "planner": "planner",
+                "summarize": "summarize", 
+                "end": GraphBuilder.END
             }
         )
         
@@ -218,73 +214,11 @@ class MasterAgent(SubAgent):
     
     @staticmethod
     async def entry(data):
-        """入口点 - 决定路由到哪个节点"""
-        logger.info("🚪 进入Master Agent入口点")
-        # 默认进入bootstrap节点进行引导
-        return "bootstrap"
+        """入口点 - 直接路由到planner进行统一决策"""
+        logger.info("🚪 进入Master Agent入口点，直接路由到planner")
+        return "planner"
     
     @node
-    async def bootstrap(self, data):
-        """引导节点 - 每次只规划第一个动作，后续通过planner节点逐步规划"""
-        user_input = data.get("input", "")
-        logger.info(f"🔄 Bootstrap节点: {user_input}")
-        
-        # 🔧 关键修复：Bootstrap只负责启动第一个动作，不进行复杂的多步骤规划
-        # 获取可用工具列表
-        available_tools = [tool.name() for tool in self.tools]
-        logger.info(f"🔧 可用工具列表: {available_tools}")
-        
-        # 🔧 重要：Bootstrap阶段只选择启动动作，不考虑次数和间隔
-        # 简化用户输入，只提取主要任务类型
-        simplified_input = self._extract_main_task(user_input)
-        logger.info(f"📝 简化任务: {simplified_input}")
-        
-        # 使用LLM分析用户意图，但只关注第一个动作
-        try:
-            intent_analysis = self.llm.analyze_user_intent(simplified_input, available_tools)
-            
-            selected_tool = intent_analysis.get("selected_tool")
-            confidence = intent_analysis.get("confidence", 0.0)
-            parameters = intent_analysis.get("parameters", {})
-            
-            logger.info(f"🎯 意图分析结果: 工具={selected_tool}, 置信度={confidence}")
-            
-            if selected_tool and confidence > 0.3:
-                # 🔧 重要：只创建一个动作，让planner负责后续规划
-                logger.info(f"✅ Bootstrap选择工具: {selected_tool} (单次执行)")
-                
-                action = LCAgentAction(
-                    tool=selected_tool,
-                    tool_input=parameters,
-                    log=f"Bootstrap启动: {selected_tool}"
-                )
-                data["agent_outcome"] = [action]  # 注意：只有一个动作
-                logger.info(f"🚀 Bootstrap创建单个Action: {action.tool}")
-            else:
-                # 没有合适的工具，标记为需要通用对话
-                logger.info(f"❌ 没有合适工具，使用通用对话 (置信度: {confidence})")
-
-                action = LCAgentAction(
-                    tool="general_conversation",
-                    tool_input={"user_input": user_input},
-                    log="通用对话"
-                )
-
-                data["agent_outcome"] = [action]
-                logger.info(f"💬 Bootstrap创建对话Action")
-                
-        except Exception as e:
-            logger.error(f"LLM意图分析失败: {e}")
-            
-            raise Exception("LLM服务不可用，无法执行任何工具或SubAgent")
-        return data
-    
-    def _extract_main_task(self, user_input: str) -> str:
-        """直接返回用户输入，不做任何关键词匹配处理"""
-        return user_input.strip()
-    
-    @node
-    @edge(target_node="planner")
     async def execute_tools(self, data):
         """执行工具节点 - 确保每次只执行一个动作"""
         agent_outcome = data.get("agent_outcome")
@@ -292,7 +226,6 @@ class MasterAgent(SubAgent):
         logger.info(f"🛠️ 进入execute_tools_node，agent_outcome类型: {type(agent_outcome)}")
         logger.info(f"🛠️ agent_outcome内容: {agent_outcome}")
 
-        # 🔧 关键修复：确保每次只处理一个动作
         actions: List[LCAgentAction] = []
         if isinstance(agent_outcome, list):
             # 🔧 重要：即使agent_outcome是列表，也只取第一个动作
@@ -316,9 +249,97 @@ class MasterAgent(SubAgent):
         if actions:
             action = actions[0]
             logger.info(f"🛠️ 开始执行单个工具: {action.tool}")
-            
             try:
+                # 🔥 修复：特殊处理former工具 - 直接传递表单数据
+                if action.tool == "former":
+                    # 🔥 新逻辑：直接传递form_data参数
+                    current_form_session = data.get("form_session")
+                    if current_form_session and current_form_session.get("form_data"):
+                        # 提取表单数据，只传递fields部分
+                        form_data = current_form_session["form_data"].get("fields", {})
+                        action.tool_input["form_data"] = form_data
+                        logger.info(f"🔄 传递表单数据给Former工具: {list(form_data.keys())}")
+                        logger.info(f"🔄 表单字段值: {form_data}")
+                    else:
+                        logger.info(f"🔄 没有现有表单数据，Former工具将从空白开始")
+                        action.tool_input["form_data"] = {}
+                
+                # 统一使用tool_executor处理所有工具调用，确保触发LangGraph事件
                 result = await self.tool_executor.ainvoke(action)
+                
+                # 特殊处理former工具的会话状态和跳转指令
+                if action.tool == "former" and isinstance(result, dict):
+                    # 更新 form_session 到 AgentState
+                    if result.get("session_id"):
+                        data["form_session"] = {
+                            "session_id": result["session_id"],
+                            "form_data": {"fields": result.get("form_data", {})},  # 包装在fields中以保持兼容性
+                            "form_stage": result.get("form_stage"),
+                            "requires_user_input": result.get("requires_user_input", True),
+                            "target_workflow": result.get("target_workflow", "")  # 🔥 保存目标工作流
+                        }
+                    
+                    # 🔥 关键修复：如果former需要等待用户输入，直接结束流程
+                    if result.get("requires_user_input") is True:
+                        logger.info("🛑 Former工具需要等待用户输入，直接结束流程")
+                        
+                        # 记录到intermediate_steps - 在提前返回之前保存
+                        if not data.get("intermediate_steps"):
+                            data["intermediate_steps"] = []
+                        data["intermediate_steps"].append((action, result))
+                        
+                        # 记录到tool_results
+                        data["tool_results"].append({
+                            "tool": action.tool,
+                            "ok": bool(result.get("success", True)) if isinstance(result, dict) else True,
+                            "payload": result
+                        })
+                        
+                        # 🔥 新增：立即同步到全局状态 (前置到提前返回之前)
+                        try:
+                            from ..websocket.server import global_agent_states
+                            # 尝试从多个位置获取session_id
+                            session_id = data.get('session_id') or getattr(data, 'session_id', None)
+                            if not session_id:
+                                # 从agent_metadata获取
+                                agent_metadata = data.get('agent_metadata')
+                                if agent_metadata and hasattr(agent_metadata, 'session_id'):
+                                    session_id = agent_metadata.session_id
+                                elif agent_metadata and isinstance(agent_metadata, dict):
+                                    session_id = agent_metadata.get('session_id')
+                            
+                            logger.info(f"🔍 尝试同步(former等待输入)，session_id: {session_id}")
+                            
+                            if session_id and session_id in global_agent_states:
+                                # 更新global_agent_states中的tool_results
+                                global_agent_states[session_id]["tool_results"] = data["tool_results"]
+                                if "form_session" in data:
+                                    global_agent_states[session_id]["form_session"] = data["form_session"]
+                                logger.info(f"🔄 已同步AgentState到全局状态(former等待): {session_id}")
+                            else:
+                                logger.warning(f"⚠️ 无法同步: session_id={session_id}, keys={list(global_agent_states.keys()) if global_agent_states else 'None'}")
+                        except Exception as sync_error:
+                            logger.warning(f"⚠️ 同步到全局状态失败: {sync_error}")
+                            import traceback
+                            logger.warning(traceback.format_exc())
+                        
+                        # 使用former的输出作为最终结果
+                        data["final_result"] = result.get("message", "等待用户进一步输入")
+                        data["agent_outcome"] = []  # 清空，表示结束
+                        data["next_action"] = "finish"
+                        return data
+                    
+                    # 提取former工具的跳转指令
+                    if result.get("next_tool_instruction"):
+                        data["next_tool_instruction"] = result["next_tool_instruction"]
+                        data["tool_routing_reason"] = result.get("routing_reason", "Former工具指定跳转")
+                        logger.info(f"🎯 Former工具指定下一步: {result['next_tool_instruction']}")
+                    
+                    if result.get("force_summary"):
+                        data["force_summary"] = True
+                        data["tool_routing_reason"] = result.get("routing_reason", "Former工具要求终止并总结")
+                        logger.info(f"🛑 Former工具要求跳转到summary")
+                
                 
                 # 记录到intermediate_steps
                 if not data.get("intermediate_steps"):
@@ -332,110 +353,59 @@ class MasterAgent(SubAgent):
                     "payload": result
                 })
                 
+                # 🔥 新增：立即同步到全局状态 (用于WebSocket前端显示)
+                try:
+                    from ..websocket.server import global_agent_states
+                    # 尝试从多个位置获取session_id
+                    session_id = data.get('session_id') or getattr(data, 'session_id', None)
+                    if not session_id:
+                        # 从agent_metadata获取
+                        agent_metadata = data.get('agent_metadata')
+                        if agent_metadata and hasattr(agent_metadata, 'session_id'):
+                            session_id = agent_metadata.session_id
+                        elif agent_metadata and isinstance(agent_metadata, dict):
+                            session_id = agent_metadata.get('session_id')
+                    
+                    logger.info(f"🔍 尝试同步，session_id: {session_id}")
+                    
+                    if session_id and session_id in global_agent_states:
+                        # 更新global_agent_states中的tool_results
+                        global_agent_states[session_id]["tool_results"] = data["tool_results"]
+                        if "form_session" in data:
+                            global_agent_states[session_id]["form_session"] = data["form_session"]
+                        logger.info(f"🔄 已同步AgentState到全局状态: {session_id}")
+                except Exception as sync_error:
+                    logger.warning(f"⚠️ 同步到全局状态失败: {sync_error}")
+                    import traceback
+                    logger.warning(traceback.format_exc())
+                
                 logger.info(f"✅ 工具执行完成: {action.tool}")
                 
             except Exception as e:
                 logger.error(f"❌ 工具执行失败: {action.tool}, 错误: {e}")
+                import traceback
+                logger.error(f"❌ 详细错误信息:\n{traceback.format_exc()}")
                 err = {"success": False, "error": str(e)}
                 if not data.get("intermediate_steps"):
                     data["intermediate_steps"] = []
                 data["intermediate_steps"].append((action, err))
                 data["tool_results"].append({"tool": action.tool, "ok": False, "payload": err})
-
-        # 🔧 关键：清空agent_outcome，避免重复执行
+        # 清空agent_outcome，避免重复执行
         data["agent_outcome"] = []
         logger.info(f"🔄 工具执行完成，清空agent_outcome，进入planner节点")
-        
         return data
-    
-    @node
-    @edge(target_node="planner")
-    async def general_conversation(self, data: AgentState) -> AgentState:
-        """通用对话节点 - 处理不需要工具的对话"""
-        user_input = data.get("input", "")
-        conversation_history = data.get("conversation_history", [])
-        
-        logger.info(f"💬 通用对话节点: {user_input}")
-        
-        # 如果LLM可用，使用智能对话
-        if self.llm.api_available:
-            try:
-                # 构建通用对话提示词
-                system_prompt = """你是DataFlow智能助手，一个专业、友好、智能的AI助手。你可以：
-
-1. 回答各种通用问题（科学、技术、生活、学习等）
-2. 提供专业的编程、数据分析建议
-3. 协助解决问题和提供创意想法
-4. 记住对话历史，保持连贯对话
-5. 当用户需要时，建议使用专业工具（API密钥、表单生成、数据处理等）
-
-你的特点：
-- 知识丰富，善于分析和解释
-- 回答准确、有条理
-- 语言自然、友好
-- 能够根据上下文理解用户真正的需求
-- 如果用户问题可能需要专业工具，会主动建议
-
-请用中文回答，保持专业但友好的语气。"""
-
-                # 构建对话历史
-                history_text = self._build_history_text(conversation_history, k=8, clip=200)
-                
-                user_prompt = f"""用户问题: {user_input}
-
-对话历史:
-{history_text}
-
-请基于对话历史和当前问题，给出最合适的回答。如果用户询问之前的对话内容，请准确回忆。如果问题可能需要专业工具协助（如API密钥获取、表单生成、数据分析、代码生成等），请主动建议。"""
-
-                # 调用LLM
-                llm_service = self.llm._create_llm_service()
-                responses = llm_service.generate_from_input(
-                    user_inputs=[user_prompt],
-                    system_prompt=system_prompt
-                )
-                
-                if responses and responses[0]:
-                    response = responses[0].strip()
-                    
-                    # 如果回复太短，尝试扩展
-                    if len(response) < 30:
-                        followup_prompt = f"""用户问题: {user_input}
-
-请提供一个更详细、更有帮助的回答。即使问题简单，也要给出友好的回复和可能的扩展建议。如果问题涉及技术，可以提供一些相关背景知识。"""
-                        
-                        followup_responses = llm_service.generate_from_input(
-                            user_inputs=[followup_prompt],
-                            system_prompt=system_prompt
-                        )
-                        
-                        if followup_responses and followup_responses[0]:
-                            response = followup_responses[0].strip()
-                    
-
-                    finish = LCAgentFinish(
-                        return_values={"output": response},
-                        log="通用对话完成"
-                    )
-
-                    data["agent_outcome"] = finish
-                    return data
-                    
-            except Exception as e:
-                logger.error(f"通用对话LLM调用失败: {e}")
-        
-        # LLM不可用时的fallback逻辑
-        raise Exception("LLM服务不可用，无法处理对话")
     
     @node
     async def planner(self, data: AgentState) -> AgentState:
         """规划器节点 - 每次只规划下一个单独动作"""
+        from langchain_core.agents import AgentAction as LCAgentAction
+        
         # ✅ 步数护栏
         if data.get('loop_guard') is None:
             data["loop_guard"] = 0
         data["loop_guard"] += 1
         
-        max_steps = data.get('max_steps', 8)
+        max_steps = data.get('max_steps', 20)
         if data["loop_guard"] >= max_steps:
             # 触发护栏直接结束
             logger.info(f"🛑 达到最大步骤数 {max_steps}，自动结束")
@@ -444,8 +414,99 @@ class MasterAgent(SubAgent):
             return data
             
         logger.info(f"🎯 进入规划器节点 - 步骤 {data['loop_guard']}/{max_steps}")
+
+        # 🎯 优先检查Former工具的跳转指令（优先于LLM决策）
+        if data.get("force_summary"):
+            logger.info(f"🛑 Former工具要求强制跳转到summary: {data.get('tool_routing_reason')}")
+            data["agent_outcome"] = []  # 清空，直接进入summary
+            data["next_action"] = "finish"  # 设置路由到summary
+            # 清空跳转指令
+            data["force_summary"] = False
+            data["tool_routing_reason"] = None
+            return data
+            
+        if data.get("next_tool_instruction"):
+            next_tool = data["next_tool_instruction"]
+            reason = data.get("tool_routing_reason", "Former工具指定")
+            logger.info(f"🎯 Former工具指定跳转到: {next_tool} | 原因: {reason}")
+            
+            # 从former工具的表单数据中提取参数
+            tool_input = {}
+            if next_tool == "code_workflow_agent":
+                form_session = data.get("form_session", {})
+                form_data = form_session.get("form_data", {})
+                user_requirements = form_data.get("fields", {}).get("user_requirements", "")
+                if user_requirements:
+                    tool_input = {"requirement": user_requirements}
+                else:
+                    # 如果没有表单数据，使用原始用户输入
+                    tool_input = {"requirement": data.get("input", "")}
+            
+            # 直接构造AgentAction
+            agent_action = LCAgentAction(
+                tool=next_tool,
+                tool_input=tool_input,
+                log=f"Former工具指定: {reason}"
+            )
+            data["agent_outcome"] = [agent_action]
+            data["next_action"] = "continue"
+            
+            # 清空跳转指令
+            data["next_tool_instruction"] = None
+            data["tool_routing_reason"] = None
+            
+            return data
+
+        # 简化的上下文信息
+        user_input = data.get('input', '')
+        tool_results_count = len(data.get('tool_results', []))
+        form_session = data.get('form_session')
+        has_form_session = bool(form_session)
         
-        # 🔧 关键修复：每次只规划下一个单独动作
+        logger.debug(f"📝 简化上下文: 用户输入='{user_input[:50]}...', 工具执行次数={tool_results_count}, 表单会话={has_form_session}")
+        
+        # � 优先检查最近工具的后置建议
+        tool_results = data.get("tool_results", [])
+        if tool_results:
+            last_result = tool_results[-1]  # 获取最后一个工具结果
+            payload = last_result.get("payload", {})
+            
+            # 检查是否有后置工具建议
+            if "followup_recommendation" in payload:
+                rec = payload["followup_recommendation"]
+                if isinstance(rec, dict) and rec.get("needs_followup"):
+                    suggested_tool = rec.get("tool_name", "")
+                    reason = rec.get("reason", "")
+                    
+                    # 检查表单完整性
+                    form_complete = payload.get("form_complete", True)
+                    
+                    if not form_complete and suggested_tool:
+                        logger.info(f"🎯 检测到表单不完整，直接采用工具建议: {suggested_tool}")
+                        logger.info(f"📋 建议原因: {reason}")
+                        
+                        # 直接创建后置工具动作，跳过LLM决策
+                        tool_input = {}
+                        if suggested_tool == "continue_chat":
+                            # 构建Former Tool的会话上下文
+                            session_context = rec.get("session_context", {})
+                            tool_input = {
+                                "prompt": "请继续表单对话",
+                                "context": json.dumps(session_context) if session_context else f"当前需求: {data.get('input', '')}"
+                            }
+                        
+                        single_action = LCAgentAction(
+                            tool=suggested_tool,
+                            tool_input=tool_input,
+                            log=f"工具建议: {suggested_tool}"
+                        )
+                        
+                        data["agent_outcome"] = [single_action]
+                        data["next_action"] = "continue"
+                        
+                        logger.info(f"📋 采用工具建议: {suggested_tool}")
+                        return data
+        
         try:
             analysis = self._analyze_user_needs(data.get("input", ""), data.get("tool_results", []))
             logger.info(f"📋 需求分析: {analysis}")
@@ -470,8 +531,6 @@ class MasterAgent(SubAgent):
                 data["agent_outcome"] = []  # 清空，让summarize_node处理
                 data["next_action"] = "finish"
                 logger.info(f"🏁 Planner决定结束，流转到summarize节点")
-                logger.info(f"📋 结束原因: {'; '.join(analysis['reasons']) if isinstance(analysis['reasons'], list) else analysis['reasons']}")
-                
             return data
             
         except Exception as e:
@@ -492,8 +551,32 @@ class MasterAgent(SubAgent):
     @node
     @edge(target_node=GraphBuilder.END)
     async def summarize(self, data: AgentState) -> AgentState:
-        """总结节点 - 智能总结所有工具执行结果，而不是简单的步骤计数"""
+        """总结节点 - 处理工具执行结果总结或通用对话回复"""
         logger.info(f"📝 总结节点开始，intermediate_steps数量: {len(data.get('intermediate_steps', []))}")
+        
+        # 🔥 关键修复：如果有final_result（来自former等待用户输入），直接使用
+        if data.get("final_result"):
+            logger.info("📝 检测到final_result，直接使用former的输出")
+            finish = LCAgentFinish(
+                return_values={"output": data.get("final_result")},
+                log="Former直接输出"
+            )
+            data["agent_outcome"] = finish
+            return data
+        
+        # 🔥 新增：检查是否有former工具的输出，如果有就直接使用
+        former_output = None
+        for action, result in data.get("intermediate_steps", []):
+            if action.tool == "former" and isinstance(result, dict):
+                former_output = result.get("message")
+                if former_output:
+                    logger.info("📝 检测到former工具输出，直接使用而不重新总结")
+                    finish = LCAgentFinish(
+                        return_values={"output": former_output},
+                        log="Former工具直接输出"
+                    )
+                    data["agent_outcome"] = finish
+                    return data
         
         # 检查是否有错误消息
         if data.get('error_message'):
@@ -513,17 +596,7 @@ class MasterAgent(SubAgent):
             logger.info("📝 检测到已有return_values，直接返回")
             return data
         
-        # 🔧 核心修复：对所有工具执行结果进行LLM智能总结
-        intermediate_steps = data.get('intermediate_steps', [])
-        if intermediate_steps:
-            logger.info(f"🤖 开始LLM智能总结，共{len(intermediate_steps)}个执行步骤")
-            final_output = await self._generate_conversation_response(data)
-            logger.info(f"✅ LLM智能总结完成: {final_output[:100]}...")
-        else:
-            # 如果没有工具执行，直接使用通用对话回复
-            logger.info("💬 没有工具执行，使用通用对话回复")
-            final_output = await self._get_direct_conversation_response(data)
-        
+        final_output = await self._generate_conversation_response(data)
 
         finish = LCAgentFinish(
             return_values={"output": final_output},
@@ -555,10 +628,10 @@ class MasterAgent(SubAgent):
             # 检查是否有loop_guard（表示在planner中达到最大步数）
             if data.get('loop_guard', 0) >= data.get('max_steps', 8):
                 logger.info("🛑 达到最大步数，进入总结阶段")
-                return "summarize"
+                return "end"
             else:
                 logger.info("🔄 工具执行完成，回到planner继续决策")
-                return "planner"
+                return "planner"  # 回到planner而不是execute_tools
         
         # 获取agent_action - 直接使用agent_outcome或从列表中取第一个
         if isinstance(agent_outcome, list):
@@ -573,16 +646,16 @@ class MasterAgent(SubAgent):
             if hasattr(agent_action, 'tool'):
                 tool_name = agent_action.tool
                 logger.info(f"🔧 LangGraph模式 - 工具名: {tool_name}")
-                # 除了general_conversation外，所有工具都路由到execute_tools
-                if tool_name == "general_conversation":
-                    logger.info("💬 路由到: general_conversation")
-                    return "general_conversation"
+                # 🔧 简化：移除general_conversation，end工具直接到summarize
+                if tool_name == "end":
+                    logger.info("🏁 路由到: end (summarize)")
+                    return "end"
                 else:
                     logger.info(f"🛠️ 路由到: execute_tools (工具: {tool_name})")
                     return "execute_tools"
             
-        logger.info("⚠️ 无匹配条件，默认路由到general_conversation")
-        return "general_conversation"
+        logger.info("⚠️ 无匹配条件，默认路由到end")
+        return "end"
 
     def _build_history_text(self, conversation_history: List[Dict[str, str]], k: int = 8, clip: int = 200) -> str:
         """把最近 k 条历史拼成统一文本；长消息裁剪到 clip 字符。"""
@@ -628,8 +701,12 @@ class MasterAgent(SubAgent):
                 # 动态提取结果中的重要信息
                 important_fields = []
                 for key, value in result.items():
-                    # 不跳过任何字段，让LLM看到完整的工具返回数据
-                    if isinstance(value, (str, int, float, bool)) and len(str(value)) < 200:
+                    # 特殊处理代码类字段，不限制长度
+                    if key in ['current_code', 'generated_code', 'code', 'output']:
+                        if isinstance(value, str) and value.strip():
+                            important_fields.append(f"{key}: {value}")
+                    # 其他字段保持原有限制
+                    elif isinstance(value, (str, int, float, bool)) and len(str(value)) < 200:
                         important_fields.append(f"{key}: {value}")
                 
                 # 判断执行状态 - 更智能的状态判断
@@ -667,13 +744,18 @@ class MasterAgent(SubAgent):
             Exception("LLM服务不可用，无法执行任何工具或SubAgent")
         
         try:
-            # 构建更智能的提示词，要求大模型进行深度总结
-            system_prompt = """你是DataFlow智能助手。请基于工具执行结果进行总结。
+            # 构建简洁实用的提示词
+            system_prompt = """你是DataFlow智能助手。基于工具执行结果简洁回复用户。
 
 要求：
-1. 准确显示所有工具返回的数据，包括具体的API密钥值
-2. 不要编造信息，所有内容都基于执行报告
-3. 用自然的语言总结执行结果"""
+0.如果没有工具执行结果，正常回复用户输入
+1. 直接回答用户的问题，展示工具返回的核心结果
+2. 如果工具生成了代码，直接展示代码
+3. 如果工具返回了数据，直接提供数据
+4. 语言要简洁自然，不要冗长的分析说明
+5. 所有内容基于实际工具输出，不编造信息
+6.如果明显是former需要和用户确认，那么直接回复用户former的返回结果
+"""
 
             # 构建对话历史文本
             history_text = self._build_history_text(conversation_history, k=10, clip=300)
@@ -686,18 +768,11 @@ class MasterAgent(SubAgent):
                 execution_report = f"执行报告构建失败: {str(report_error)}"
             
             user_prompt = f"""用户请求: {user_input}
-
 执行过程详细报告:
 {execution_report}
-
 对话历史:
 {history_text}
-
-请你作为智能助手，对这次执行结果进行全面、详细的总结。特别要注意：
-1. 执行报告中的所有数据都是真实的工具返回结果，必须准确显示
-2.不需要详细说明执行流程，只需总结结果和分析
-3. 用户有权查看所有工具返回的数据，不要隐藏任何信息
-4. 基于报告中的真实数据进行分析，不要编造"""
+"""
 
             logger.info(f"🚀 准备调用LLM，user_prompt长度: {len(user_prompt)}")
             
@@ -790,9 +865,8 @@ class MasterAgent(SubAgent):
                 
                 # 再添加其他字段
                 for key, value in result.items():
-                    if key not in priority_fields and isinstance(value, (str, int, float, bool)):
-                        if len(str(value)) < 100:  # 只显示合理长度的字段
-                            key_info.append(f"{key}: {value}")
+                    if key not in priority_fields and isinstance(value, (str, int, float, bool)) and len(str(value)) < 100:  # 只显示合理长度的字段
+                        key_info.append(f"{key}: {value}")
                 
                 if key_info:
                     # 显示所有重要字段，不截断
@@ -806,94 +880,6 @@ class MasterAgent(SubAgent):
         
         return "\n".join(report_sections)
     
-    async def _get_direct_conversation_response(self, data: AgentState) -> str:
-        """当没有工具执行时，获取直接对话回复"""
-        user_input = data.get("input", "")
-        conversation_history = data.get("conversation_history", [])
-        
-        # 直接使用LLM，不做fallback
-        if self.llm.api_available:
-            try:
-                system_prompt = "你是DataFlow智能助手，请直接、自然地回答用户问题。"
-                
-                # 构建对话历史
-                history_text = self._build_history_text(conversation_history, k=8, clip=200)
-                
-                user_prompt = f"""用户问题: {user_input}
-
-对话历史:
-{history_text}
-
-请基于对话历史自然地回答用户问题。"""
-                
-                llm_service = self.llm._create_llm_service()
-                responses = llm_service.generate_from_input(
-                    user_inputs=[user_prompt],
-                    system_prompt=system_prompt
-                )
-                
-                if responses and responses[0]:
-                    return responses[0].strip()
-                    
-            except Exception as e:
-                logger.error(f"LLM调用失败: {e}")
-                raise e
-        
-        # LLM不可用时抛出异常
-        raise Exception("LLM服务不可用，无法处理对话")
-
-    async def _planner(self, state: AgentState) -> PlannerOutput:
-        """智能规划器：基于用户需求和已执行的工具结果，决定下一步行动"""
-        user_input = state.get("input", "")
-        tool_results = state.get("tool_results", [])
-        
-        # 分析用户原始需求中的关键信息
-        needs_analysis = self._analyze_user_needs(user_input, tool_results)
-        
-        logger.info(f"🎯 规划器分析: {needs_analysis}")
-        
-        # 基于分析结果决定下一步
-        if needs_analysis["should_continue"]:
-            next_action = needs_analysis["next_action"]
-            logger.info(f"✅ 规划器决定继续: {next_action}")
-            return PlannerOutput(
-                decision="continue",
-                next_actions=[next_action],
-                reasons="; ".join(needs_analysis["reasons"]) if isinstance(needs_analysis["reasons"], list) else needs_analysis["reasons"]
-            )
-        else:
-            logger.info(f"🏁 规划器决定结束: {needs_analysis['reasons']}")
-            # 生成简单的总结消息，避免复杂的LLM调用 - 通用化处理
-            summary_msg = "任务已完成"
-            tool_results = state.get("tool_results", [])
-            if tool_results:
-                latest_result = tool_results[-1]
-                tool_name = latest_result.get("tool", "未知工具")
-                result_data = latest_result.get("result", {})
-                
-                # 通用化地提取结果信息
-                if isinstance(result_data, dict):
-                    important_info = []
-                    for key, value in result_data.items():
-                        if key in ["success", "ok", "status"]:
-                            continue
-                        elif isinstance(value, (str, int, float)) and len(str(value)) < 50:
-                            important_info.append(f"{key}: {value}")
-                    
-                    if important_info:
-                        info_text = ", ".join(important_info[:1])  # 只显示第1个重要字段
-                        summary_msg = f"已完成{tool_name}执行，结果: {info_text}"
-                    else:
-                        summary_msg = f"已完成{tool_name}执行"
-                else:
-                    summary_msg = f"已完成{tool_name}执行"
-            
-            return PlannerOutput(
-                decision="finish",
-                user_message=summary_msg,
-                reasons="; ".join(needs_analysis["reasons"]) if isinstance(needs_analysis["reasons"], list) else needs_analysis["reasons"]
-            )
-
     def _analyze_user_needs(self, user_input: str, tool_results: List[Dict]) -> Dict[str, Any]:
         """让LLM智能分析用户需求和当前执行状态，决定下一步行动 - 完全基于LLM决策"""
         
@@ -939,14 +925,37 @@ class MasterAgent(SubAgent):
                         if is_tool_success:
                             step_info += " - 成功"
                             
-                            # 通用化地提取重要信息，显示所有关键字段
-                            important_info = []
+                            # 特别提取工具建议信息
+                            tool_recommendations = []
+                            if "followup_recommendation" in payload:
+                                rec = payload["followup_recommendation"]
+                                if isinstance(rec, dict) and rec.get("needs_followup"):
+                                    tool_name = rec.get("tool_name", "")
+                                    reason = rec.get("reason", "")
+                                    tool_recommendations.append(f"推荐后置工具: {tool_name} (原因: {reason})")
+                            
+                            # 提取表单完整性信息
+                            form_info = []
+                            if "form_complete" in payload:
+                                form_complete = payload["form_complete"]
+                                if not form_complete:
+                                    form_info.append("表单信息不完整")
+                            
+                            # 🔥 关键修复：检查是否需要等待用户输入
+                            waiting_status = []
+                            if payload.get("requires_user_input") is True:
+                                waiting_status.append("等待用户输入")
+                            
+                            # 优先显示等待状态，然后是工具建议和表单状态
+                            important_info = waiting_status + tool_recommendations + form_info
+                            
+                            # 添加其他重要字段
                             for key, value in payload.items():
-                                if isinstance(value, (str, int, float, bool)) and len(str(value)) < 50:
+                                if key not in ["followup_recommendation", "form_complete"] and isinstance(value, (str, int, float, bool)) and len(str(value)) < 50:
                                     important_info.append(f"{key}: {value}")
                             
                             if important_info:
-                                info_text = ", ".join(important_info[:3])  # 显示前3个重要字段
+                                info_text = ", ".join(important_info[:5])  # 显示前5个重要信息
                                 step_info += f" ({info_text})"
                         else:
                             step_info += " - 失败"
@@ -961,18 +970,16 @@ class MasterAgent(SubAgent):
             system_prompt = """你是一个智能决策助手，需要根据用户需求和当前执行情况，决定下一步应该执行什么工具。
 
 决策原则：
-1. 仔细理解用户的完整需求，包括要执行多少次、是否需要间隔等
-2. 分析当前的执行历史，了解已经完成了什么
-3. 基于工具的功能描述，选择最合适的下一步动作
-4. 每次只决策一个动作，不要一次性规划多个步骤
-5. 如果任务已完成，应该选择结束
+1. **简单问候直接回应**：对于"你好"、"hi"等简单问候，直接完成任务，不需要使用任何工具
+2. **明确任务才使用工具**：只有当用户明确提出具体任务需求时，才选择合适的工具
+3. **避免重复调用**：如果某个工具已经执行过，除非有明确的理由，否则不要重复调用相同工具
 
 **重要：你必须只输出JSON格式，不要有任何额外的解释文字！**
 
 返回格式（必须是纯JSON，无任何其他内容）：
 {
     "decision": "continue" 或 "finish",
-    "tool": "工具名称",
+    "tool": "工具名称（仅当decision为continue时）",
     "tool_input": {"参数名": "参数值"},
     "finish_message": "任务完成说明（仅当decision为finish时）",
     "reason": "简短的决策原因"
@@ -987,8 +994,6 @@ class MasterAgent(SubAgent):
 {chr(10).join(execution_history) if execution_history else "还没有执行任何工具"}
 
 请分析当前情况，决定下一步应该：
-1. 继续执行某个工具（如果任务未完成）
-2. 还是结束任务（如果已经满足用户需求）
 
 **重要：只输出JSON格式，不要任何解释文字！**"""
 
@@ -1141,5 +1146,3 @@ class MasterAgent(SubAgent):
             logger.debug(f"动态解析工具{tool.name()}参数失败: {e}")
             # 最终fallback
             return '{"user_message": "string(通用参数)"}'
-
-

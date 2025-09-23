@@ -36,7 +36,7 @@ class AgentMetadata(BaseModel):
 
 
 class BaseTool(ABC):
-    """基础工具类，模仿 myscalekb-agent-base.tool.BaseTool"""
+    """基础工具类，模仿 myscalekb-agent-base.tool.BaseTool，支持前置/后置工具架构"""
     
     @classmethod
     @abstractmethod
@@ -49,6 +49,26 @@ class BaseTool(ABC):
     def description(cls) -> str:
         """工具描述"""
         pass
+    
+    @classmethod
+    def prerequisite_tools(cls) -> List[str]:
+        """前置工具列表 - 建议在调用此工具前先调用的工具"""
+        return []
+    
+    @classmethod
+    def suggested_followup_tools(cls) -> List[str]:
+        """建议的后置工具列表 - 此工具完成后建议调用的工具"""
+        return []
+    
+    @classmethod
+    def get_tool_metadata(cls) -> Dict[str, Any]:
+        """获取工具的完整元数据"""
+        return {
+            "name": cls.name(),
+            "description": cls.description(),
+            "prerequisite_tools": cls.prerequisite_tools(),
+            "suggested_followup_tools": cls.suggested_followup_tools()
+        }
     
     @abstractmethod
     def params(self) -> Type[BaseModel]:
@@ -253,7 +273,7 @@ class GraphBuilder:
                 source_node = name.replace('_decision', '') if name.endswith('_decision') else name
                 if source_node in node_methods:
                     workflow.add_conditional_edges(
-                        source=source_node, path=method, path_map=method._path_map
+                        source=source_node, path=method._path, path_map=method._path_map
                     )
                     logger.debug(f"Added conditional edge from {source_node}")
                 else:
