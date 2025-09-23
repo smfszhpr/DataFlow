@@ -188,13 +188,12 @@ class FormerTool:
             
             logger.info(f"🔍 即将执行的action: {params.action}")
             
-            if params.action == "create_form":
-                result = self._create_form(params, session_id)
-            elif params.action == "continue_chat":
-                result = self._continue_chat(params, session_id, session_data)
-            elif params.action == "submit_form":
+            # 🔥 简化：统一使用 _create_form 处理所有情况
+            # _create_form 已经包含了检测和处理现有表单数据的逻辑
+            if params.action == "submit_form":
                 result = self._submit_form(params, session_id, session_data)
             else:
+                # 所有其他情况（create_form, collect_user_response 等）都用 _create_form
                 result = self._create_form(params, session_id)
             
             logger.info(f"🔍 Former Tool 执行结果概览:")
@@ -280,11 +279,16 @@ class FormerTool:
                 missing_params = [p for p in missing_params if p.get("name", p) not in extracted_params]
                 logger.info(f"🔄 重新评估缺失参数: {[p.get('name', p) for p in missing_params]}")
             
-            # 🔥 新增：基于实际情况重新决策
+            # 🔥 新增：基于实际情况重新决策，但始终需要用户确认
             if not missing_params and extracted_params:
-                # 如果所有参数都有了，可以执行
-                decision = "ready_to_execute"
-                logger.info(f"🔄 参数已完整，更新决策为ready_to_execute")
+                # 参数已完整，但仍需用户确认（除非用户明确表示确认）
+                user_confirmed = any(keyword in params.user_query.lower() for keyword in ["确认", "确定", "开始", "执行", "提交", "是的", "yes"])
+                if user_confirmed:
+                    decision = "ready_to_execute"
+                    logger.info(f"🔄 用户已确认，决策为ready_to_execute")
+                else:
+                    decision = "need_more_info"  # 参数完整但需要确认
+                    logger.info(f"🔄 参数已完整但需要用户确认，保持need_more_info决策")
             elif missing_params:
                 # 仍有缺失参数，需要更多信息
                 decision = "need_more_info"
@@ -299,24 +303,18 @@ class FormerTool:
                 "created_at": str(datetime.now())
             }
             
-            # 🔄 根据决策确定下一步 - 修复summary幻觉问题
+            # 🔄 根据决策确定下一步动作  
             if decision == "ready_to_execute":
                 # 参数完整，直接提供完整代码
-                next_instruction = "END"  # 直接结束，不经过summary
-                force_summary_flag = False
-                # 直接在这里提供完整的代码实现
-                response_message = self._provide_direct_code_solution(extracted_params)
-                
+                response_message = None
             elif decision == "need_more_info":
                 # 需要收集更多参数，等待用户输入
-                next_instruction = "END"  # 等待用户输入，不继续调用工具
-                force_summary_flag = False  # 不触发summary
+                response_message = analysis_result.get("response_message", "请提供更多信息")
             else:  # clarification_needed
                 # 需要澄清需求，等待用户输入
-                next_instruction = "END"  # 等待用户输入，不继续调用工具
-                force_summary_flag = False  # 不触发summary
+                response_message = analysis_result.get("response_message", "请澄清您的需求")
             
-            # 🔥 新增：构建统一的form_data结构
+            # 🔥 构建统一的form_data结构
             form_data = {}
             # 添加所有参数（已填写和未填写）
             for param in missing_params:
@@ -333,12 +331,9 @@ class FormerTool:
                 "session_id": session_id,
                 "form_stage": "parameter_collection",
                 "target_workflow": target_workflow,
-                "form_data": form_data,  # 🔥 简化：统一的表单数据结构
+                "form_data": form_data,  # 统一的表单数据结构
                 "requires_user_input": decision != "ready_to_execute",
                 "form_complete": decision == "ready_to_execute",
-                # 🎯 跳转控制字段  
-                "next_tool_instruction": next_instruction if decision == "ready_to_execute" else None,
-                "force_summary": force_summary_flag,
                 "routing_reason": f"需求分析决策: {decision}"
             }
             
@@ -350,30 +345,7 @@ class FormerTool:
                 "message": f"分析需求失败: {str(e)}",
                 "session_id": session_id
             }
-    def _continue_chat(self, params: FormerToolParams, session_id: str, session_data: Dict[str, Any]) -> Dict[str, Any]:
-        """继续对话 - 处理用户在表单交互中的响应"""
-        try:
-            logger.info(f"继续对话 - Session: {session_id}")
-            
-            user_response = params.user_response or params.user_query
-            # 处理用户响应
-            result = self._handle_user_response(session_data, user_response)
-            # 返回最新会话状态（由 Master Agent 存储）
-            result["session_data"] = session_data
-            # FormerTool 输出 next_tool/summary_flag 变量
-            result["next_tool"] = "former" if result.get("requires_user_input") else "codeworkflow"
-            result["summary_flag"] = not result.get("requires_user_input")
-            return result
-            
-        except Exception as e:
-            logger.error(f"继续对话失败: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "message": f"处理用户响应失败: {str(e)}",
-                "session_id": session_id
-            }
-    
+
     def _submit_form(self, params: FormerToolParams, session_id: str, session_data: Dict[str, Any]) -> Dict[str, Any]:
         """提交表单 - 跳转到对应工作流"""
         try:
@@ -394,35 +366,6 @@ class FormerTool:
                 "error": str(e),
                 "message": f"提交表单失败: {str(e)}",
                 "session_id": session_id
-            }
-    
-    def _handle_user_response(self, session_data: Dict[str, Any], user_response: str) -> Dict[str, Any]:
-        """处理用户响应"""
-        try:
-            logger.info(f"处理用户响应: {user_response}")
-            
-            form_data = session_data.get("form_data", {})
-            user_response_lower = user_response.lower().strip()
-            session_id = session_data.get("session_id", "unknown")
-            
-            # 检查是否是提交指令
-            if any(keyword in user_response_lower for keyword in ["确认提交", "submit", "提交", "确认"]):
-                return self._handle_form_submission(session_data)
-            
-            # 检查是否是修改指令
-            if user_response_lower.startswith("修改"):
-                return self._handle_field_modification(session_data, user_response)
-            
-            # 处理其他类型的用户输入（继续对话）
-            return self._handle_continue_chat(session_data, user_response)
-            
-        except Exception as e:
-            logger.error(f"处理用户响应失败: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "message": f"❌ 处理用户响应失败: {str(e)}",
-                "session_id": session_data.get("session_id", "unknown")
             }
     
     def _handle_form_submission(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -491,16 +434,12 @@ class FormerTool:
             "session_id": session_id,
             "form_stage": "submitted",
             "form_validated": True,
-            
             "form_data": extracted_params,
             "submitted": True,
             "requires_user_input": False,
-            # 🚀 工作流跳转控制
-            "next_tool_instruction": target_workflow,
-            "workflow_execution_params": workflow_execution_params,
             "target_workflow": target_workflow,
-            "force_summary": True,
-            "routing_reason": "表单提交完成，跳转到工作流执行"
+            "workflow_execution_params": workflow_execution_params,
+            "routing_reason": "表单提交完成"
         }
     
     def _build_workflow_params(self, workflow_name: str, extracted_params: Dict[str, Any]) -> Dict[str, Any]:
@@ -525,203 +464,6 @@ class FormerTool:
             if value is not None:
                 lines.append(f"- **{key}**: {value}")
         return "\n".join(lines) if lines else "无特殊参数"
-    
-    def _handle_field_modification(self, session_data: Dict[str, Any], user_response: str) -> Dict[str, Any]:
-        """处理字段修改"""
-        try:
-            # 解析修改指令：修改 字段名 新值
-            parts = user_response.split(None, 2)  # 分割成最多3部分
-            session_id = session_data.get("session_id", "unknown")
-            
-            if len(parts) < 3:
-                return {
-                    "success": False,
-                    "message": "❌ 修改指令格式错误。请使用格式：'修改 [字段名] [新值]'",
-                    "session_id": session_id,
-                    "form_stage": "user_interaction",
-                    
-                    "requires_user_input": True
-                }
-            
-            field_name = parts[1]
-            new_value = parts[2]
-            
-            form_data = session_data.get("form_data", {})
-            
-            # 检查字段是否存在
-            all_fields = (
-                form_data.get('metadata', {}).get('required_fields', []) +
-                form_data.get('metadata', {}).get('optional_fields', [])
-            )
-            
-            if field_name not in all_fields:
-                available_fields = ", ".join(all_fields)
-                return {
-                    "success": False,
-                    "message": f"❌ 字段 '{field_name}' 不存在。\n可用字段：{available_fields}",
-                    "session_id": session_id,
-                    "form_stage": "user_interaction",
-                    
-                    "requires_user_input": True
-                }
-            
-            # 更新字段
-            updated_form_data = self.form_generator.update_field(form_data, field_name, new_value)
-            session_data["form_data"] = updated_form_data
-            
-            # 重新生成表单展示
-            form_display = self._build_form_display(updated_form_data)
-            session_data["form_display"] = form_display
-            
-            success_msg = f"""
-✅ **字段修改成功！**
-
-已将字段 '{field_name}' 更新为：{new_value}
-
-📝 **更新后的表单：**
-{form_display}
-
-**下一步操作：**
-1. 如果表单内容正确，请回复 "确认提交" 或 "submit"
-2. 如果需要继续修改，请回复 "修改 [字段名] [新值]"
-3. 如果有其他问题，请直接描述
-"""
-            
-            return {
-                "success": True,
-                "message": success_msg,
-                "session_id": session_id,
-                "form_stage": "user_interaction",
-                
-                "form_data": updated_form_data,
-                "requires_user_input": True
-            }
-            
-        except Exception as e:
-            logger.error(f"字段修改失败: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "message": f"❌ 字段修改失败: {str(e)}",
-                "session_id": session_data.get("session_id", "unknown")
-            }
-    
-    def _handle_continue_chat(self, session_data: Dict[str, Any], user_response: str) -> Dict[str, Any]:
-        """处理继续对话（用户询问或说明）"""
-        logger.info("处理用户继续对话...")
-        
-        form_data = session_data.get("form_data", {})
-        session_id = session_data.get("session_id", "unknown")
-        
-        # 使用LLM分析用户的进一步需求并可能更新表单
-        try:
-            response_msg = self._analyze_and_respond_to_user(form_data, user_response)
-            
-            return {
-                "success": True,
-                "message": response_msg,
-                "session_id": session_id,
-                "form_stage": "user_interaction",
-                
-                "form_data": form_data,
-                "requires_user_input": True
-            }
-            
-        except Exception as e:
-            logger.error(f"处理用户对话失败: {e}")
-            current_form_display = self._build_form_display(form_data)
-            fallback_msg = f"""
-📝 **表单状态保持不变**
-
-您的输入：{user_response}
-
-当前表单状态：
-{current_form_display}
-
-**操作提示：**
-1. 确认提交：回复 "确认提交" 或 "submit"
-2. 修改字段：回复 "修改 [字段名] [新值]"
-3. 如有疑问，请更具体地描述您的需求
-"""
-            
-            return {
-                "success": True,
-                "message": fallback_msg,
-                "session_id": session_id,
-                "form_stage": "user_interaction",
-                
-                "form_data": form_data,
-                "requires_user_input": True
-            }
-    
-    def _analyze_and_respond_to_user(self, form_data: Dict[str, Any], user_response: str) -> str:
-        """分析用户输入并提供响应"""
-        current_form_display = self._build_form_display(form_data)
-        
-        prompt = f"""用户对当前表单有进一步的说明或疑问。请分析用户的输入，提供有用的回复。
-
-当前表单状态：
-{current_form_display}
-
-用户输入：{user_response}
-
-请分析用户的输入：
-1. 如果用户提供了更多需求细节，建议如何更新表单
-2. 如果用户有疑问，提供清晰的解答
-3. 给出具体的操作建议
-
-返回一个友好、有用的回复，帮助用户完善表单或解答疑问。"""
-
-        try:
-            response = self.llm.call_llm("", prompt)
-            
-            ai_response = response.get('content', '').strip()
-            
-            return f"""
-🤖 **AI 助手回复：**
-
-{ai_response}
-
-📝 **当前表单状态：**
-{current_form_display}
-
-**操作提示：**
-1. 确认提交：回复 "确认提交" 或 "submit"
-2. 修改字段：回复 "修改 [字段名] [新值]"
-3. 继续说明您的需求
-"""
-            
-        except Exception as e:
-            logger.error(f"LLM分析用户输入失败: {e}")
-            raise e
-    
-    def _build_form_display(self, form_data: Dict[str, Any]) -> str:
-        """构建表单显示内容"""
-        if not form_data or 'fields' not in form_data:
-            return "表单数据为空"
-        
-        metadata = form_data.get('metadata', {})
-        required_fields = metadata.get('required_fields', [])
-        optional_fields = metadata.get('optional_fields', [])
-        fields = form_data.get('fields', {})
-        
-        display_lines = []
-        
-        # 显示必填字段
-        if required_fields:
-            display_lines.append("**必填字段：**")
-            for field in required_fields:
-                value = fields.get(field, "[未填写]")
-                display_lines.append(f"  • {field}: {value}")
-        
-        # 显示可选字段
-        if optional_fields:
-            display_lines.append("\n**可选字段：**")
-            for field in optional_fields:
-                value = fields.get(field, "[未填写]")
-                display_lines.append(f"  • {field}: {value}")
-        
-        return "\n".join(display_lines)
     
     def _llm_analyze_and_match_workflow(self, user_input: str) -> Dict[str, Any]:
         """使用LLM深度分析用户需求并智能匹配工作流"""
@@ -774,19 +516,13 @@ class FormerTool:
 - 如果信息不完整，明确指出需要什么额外信息
 
 决策标准：
-- ready_to_execute: 参数完整且需求明确，可以直接执行
-- need_more_info: 需求明确但缺少关键参数，需要询问具体信息
+- ready_to_execute: 只有当用户明确表示要执行、确认或提交时才选择
+- need_more_info: 需求明确但缺少关键参数，如果参数已完整就简短回答让用户确认是否执行
 - clarification_needed: 需求本身不够清晰，需要澄清意图
 
 输出JSON格式：
 {{
     "success": true,
-    "analysis": {{
-        "user_intent": "深度分析的用户真实意图",
-        "technical_level": "用户技术水平评估(beginner/intermediate/advanced)",
-        "context_clues": ["从用户输入中发现的上下文线索"],
-        "implicit_requirements": ["从意图中推断的隐含需求"]
-    }},
     "target_workflow": "最适合的工作流名称",
     "extracted_params": {{"参数名": "智能提取或推断的值"}},
     "missing_params": [{{
@@ -795,7 +531,6 @@ class FormerTool:
     }}],
     "decision": "ready_to_execute|need_more_info|clarification_needed",
     "response_message": "给用户的自然、个性化回复",
-    "confidence": 0.9,
     "reasoning": "详细的决策推理过程"
 }}"""
 
@@ -810,19 +545,14 @@ class FormerTool:
 5. 评估信息的完整性"""
             
             # 调用LLM进行深度分析
-            llm_service = self.llm._create_llm_service()
-            responses = llm_service.generate_from_input(
-                user_inputs=[user_prompt],
-                system_prompt=system_prompt
-            )
+            response = self.llm.call_llm(system_prompt, user_prompt)
+            content = response.get('content', '').strip()
             
-            if not responses or not responses[0]:
+            if not content:
                 return {
                     "success": False,
                     "response_message": "抱歉，我暂时无法分析您的需求。请稍后再试。"
                 }
-            
-            content = responses[0].strip()
             
             # 清理和解析JSON
             content = self._clean_json_response(content)
@@ -834,10 +564,7 @@ class FormerTool:
                 # 验证和修正工作流选择
                 target_workflow = result.get("target_workflow")
                 if target_workflow not in self.workflow_registry:
-                    logger.warning(f"LLM选择了不存在的工作流: {target_workflow}")
-                    # 智能回退到最相似的工作流
-                    result["target_workflow"] = self._find_best_fallback_workflow(user_input)
-                    result["reasoning"] += f" [自动回退到 {result['target_workflow']}]"
+                    raise ValueError("选择了不存在的工作流")
                 
                 return result
                 
@@ -866,54 +593,4 @@ class FormerTool:
         if content.endswith("```"):
             content = content[:-3]
         return content.strip()
-    
-    def _find_best_fallback_workflow(self, user_input: str) -> str:
-        """智能选择最佳回退工作流"""
-        # 简单的语义相似度判断，可以后续扩展为更复杂的匹配算法
-        user_lower = user_input.lower()
         
-        # 目前只有一个工作流，直接返回
-        if "code_workflow_agent" in self.workflow_registry:
-            return "code_workflow_agent"
-        
-        # 如果有多个工作流，可以实现更智能的匹配逻辑
-        return list(self.workflow_registry.keys())[0] if self.workflow_registry else None
-    
-    def _provide_direct_code_solution(self, extracted_params: Dict[str, Any]) -> str:
-        """直接提供代码解决方案，避免调用其他工具"""
-        requirement = extracted_params.get("requirement", "")
-        
-        # 针对具体需求提供直接的代码解决方案
-        if "mod" in requirement.lower() and any(x in requirement.lower() for x in ["ab", "a^b", "幂", "模运算"]):
-            return """您的需求明确：需要一段高效的 Python 代码来计算 ab mod c 的结果。如果只需本地代码，代码如下：
-
-```python
-def fast_mod_exp(a, b, c):
-    return pow(a, b, c)
-
-# 示例用法
-a = 2
-b = 10
-c = 1000
-result = fast_mod_exp(a, b, c)
-print(result)  # 输出: 24
-```
-
-直接调用 fast_mod_exp(a, b, c) 即可得到 ab mod c。"""
-        
-        # 其他类型的需求也可以在这里添加直接解决方案
-        return f"""您的需求：{requirement}
-
-基于需求分析，这里提供基础的实现方案：
-
-```python
-# 根据您的需求定制的代码
-def solution():
-    pass  # 在这里实现具体逻辑
-
-# 使用示例
-result = solution()
-print(result)
-```
-
-请根据具体需求调整代码实现。"""

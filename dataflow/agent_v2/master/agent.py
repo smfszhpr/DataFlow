@@ -84,10 +84,6 @@ class AgentState(TypedDict, total=False):
     form_session: Optional[Dict[str, Any]]  # FormerTool表单会话状态，统一存储到Master Agent
     xml_content: Optional[str]
     
-    # Former工具跳转控制字段
-    next_tool_instruction: Optional[str]  # former工具指定的下一个工具
-    force_summary: Optional[bool]  # 是否强制跳转到summary
-    tool_routing_reason: Optional[str]  # 跳转原因说明
     execution_result: Optional[str]
     conversation_history: List[Dict[str, str]]  # 对话历史
     last_tool_results: Optional[Dict[str, Any]]  # 最近的工具结果
@@ -328,18 +324,6 @@ class MasterAgent(SubAgent):
                         data["agent_outcome"] = []  # 清空，表示结束
                         data["next_action"] = "finish"
                         return data
-                    
-                    # 提取former工具的跳转指令
-                    if result.get("next_tool_instruction"):
-                        data["next_tool_instruction"] = result["next_tool_instruction"]
-                        data["tool_routing_reason"] = result.get("routing_reason", "Former工具指定跳转")
-                        logger.info(f"🎯 Former工具指定下一步: {result['next_tool_instruction']}")
-                    
-                    if result.get("force_summary"):
-                        data["force_summary"] = True
-                        data["tool_routing_reason"] = result.get("routing_reason", "Former工具要求终止并总结")
-                        logger.info(f"🛑 Former工具要求跳转到summary")
-                
                 
                 # 记录到intermediate_steps
                 if not data.get("intermediate_steps"):
@@ -379,7 +363,33 @@ class MasterAgent(SubAgent):
                     import traceback
                     logger.warning(traceback.format_exc())
                 
-                logger.info(f"✅ 工具执行完成: {action.tool}")
+                # 🗑️ 新增：如果执行的是非former工具，清除表单状态和final_result
+                if action.tool != "former":
+                    if data.get("form_session"):
+                        logger.info(f"🗑️ 工作流工具 {action.tool} 执行完成，清除表单状态")
+                        data["form_session"] = None
+                    
+                    if data.get("final_result"):
+                        logger.info(f"🗑️ 工作流工具 {action.tool} 执行完成，清除final_result")
+                        data["final_result"] = None
+                    
+                    # 同时清除全局状态中的表单
+                    try:
+                        # 获取session_id
+                        session_id = data.get('session_id')
+                        if not session_id:
+                            agent_metadata = data.get('agent_metadata')
+                            if agent_metadata and hasattr(agent_metadata, 'session_id'):
+                                session_id = agent_metadata.session_id
+                            elif agent_metadata and isinstance(agent_metadata, dict):
+                                session_id = agent_metadata.get('session_id')
+                        
+                        if session_id and session_id in global_agent_states:
+                            if "form_session" in global_agent_states[session_id]:
+                                del global_agent_states[session_id]["form_session"]
+                                logger.info(f"🗑️ 已清除全局状态中的表单: {session_id}")
+                    except Exception as clear_error:
+                        logger.warning(f"⚠️ 清除全局表单状态失败: {clear_error}")
                 
             except Exception as e:
                 logger.error(f"❌ 工具执行失败: {action.tool}, 错误: {e}")
@@ -414,48 +424,6 @@ class MasterAgent(SubAgent):
             return data
             
         logger.info(f"🎯 进入规划器节点 - 步骤 {data['loop_guard']}/{max_steps}")
-
-        # 🎯 优先检查Former工具的跳转指令（优先于LLM决策）
-        if data.get("force_summary"):
-            logger.info(f"🛑 Former工具要求强制跳转到summary: {data.get('tool_routing_reason')}")
-            data["agent_outcome"] = []  # 清空，直接进入summary
-            data["next_action"] = "finish"  # 设置路由到summary
-            # 清空跳转指令
-            data["force_summary"] = False
-            data["tool_routing_reason"] = None
-            return data
-            
-        if data.get("next_tool_instruction"):
-            next_tool = data["next_tool_instruction"]
-            reason = data.get("tool_routing_reason", "Former工具指定")
-            logger.info(f"🎯 Former工具指定跳转到: {next_tool} | 原因: {reason}")
-            
-            # 从former工具的表单数据中提取参数
-            tool_input = {}
-            if next_tool == "code_workflow_agent":
-                form_session = data.get("form_session", {})
-                form_data = form_session.get("form_data", {})
-                user_requirements = form_data.get("fields", {}).get("user_requirements", "")
-                if user_requirements:
-                    tool_input = {"requirement": user_requirements}
-                else:
-                    # 如果没有表单数据，使用原始用户输入
-                    tool_input = {"requirement": data.get("input", "")}
-            
-            # 直接构造AgentAction
-            agent_action = LCAgentAction(
-                tool=next_tool,
-                tool_input=tool_input,
-                log=f"Former工具指定: {reason}"
-            )
-            data["agent_outcome"] = [agent_action]
-            data["next_action"] = "continue"
-            
-            # 清空跳转指令
-            data["next_tool_instruction"] = None
-            data["tool_routing_reason"] = None
-            
-            return data
 
         # 简化的上下文信息
         user_input = data.get('input', '')
@@ -533,6 +501,45 @@ class MasterAgent(SubAgent):
                         logger.info(f"📋 采用工具建议: {suggested_tool}")
                         return data
         
+        # 🔥 新增：检查表单是否已完成并需要执行目标工作流
+        if form_session:
+            form_complete = False
+            target_workflow = form_session.get("target_workflow", "")
+            
+            # 检查最近的former工具结果
+            if tool_results:
+                last_result = tool_results[-1]
+                if last_result.get("tool") == "former":
+                    payload = last_result.get("payload", {})
+                    form_complete = payload.get("form_complete", False)
+            
+            if form_complete and target_workflow:
+                logger.info(f"🎯 检测到表单已完成，目标工作流: {target_workflow}")
+                
+                # 从表单数据中提取参数
+                form_data = form_session.get("form_data", {})
+                if isinstance(form_data, dict) and "fields" in form_data:
+                    form_fields = form_data["fields"]
+                else:
+                    form_fields = form_data
+                
+                logger.info(f"📋 使用表单数据构建工具参数: {list(form_fields.keys()) if form_fields else 'None'}")
+                
+                # 直接创建目标工具动作，使用表单数据
+                single_action = LCAgentAction(
+                    tool=target_workflow,
+                    tool_input=form_fields or {},
+                    log=f"表单收集完成，执行目标工作流: {target_workflow}"
+                )
+                
+                data["agent_outcome"] = [single_action]
+                data["next_action"] = "continue"
+                
+                logger.info(f"📋 Planner规划下一个动作: {target_workflow} (表单数据)")
+                logger.info(f"📋 原因: 表单收集完成，使用收集的参数执行目标工作流")
+                
+                return data
+
         try:
             analysis = self._analyze_user_needs(data.get("input", ""), data.get("tool_results", []))
             logger.info(f"📋 需求分析: {analysis}")
@@ -595,16 +602,19 @@ class MasterAgent(SubAgent):
             data["agent_outcome"] = finish
             return data
         
-        # 🔥 新增：检查是否有former工具的输出，如果有就直接使用
+        # 🔥 新增：检查是否有former工具的输出，只有在需要用户输入时才直接使用
         former_output = None
+        former_requires_input = False
+        
         for action, result in data.get("intermediate_steps", []):
             if action.tool == "former" and isinstance(result, dict):
                 former_output = result.get("message")
-                if former_output:
-                    logger.info("📝 检测到former工具输出，直接使用而不重新总结")
+                former_requires_input = result.get("requires_user_input", False)
+                if former_output and former_requires_input:
+                    logger.info("📝 检测到former需要用户输入，直接使用former输出")
                     finish = LCAgentFinish(
                         return_values={"output": former_output},
-                        log="Former工具直接输出"
+                        log="Former工具等待用户输入"
                     )
                     data["agent_outcome"] = finish
                     return data
@@ -785,7 +795,6 @@ class MasterAgent(SubAgent):
 3. 如果工具返回了数据，直接提供数据
 4. 语言要简洁自然，不要冗长的分析说明
 5. 所有内容基于实际工具输出，不编造信息
-6.如果明显是former需要和用户确认，那么直接回复用户former的返回结果
 """
 
             # 构建对话历史文本
