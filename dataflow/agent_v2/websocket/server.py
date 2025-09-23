@@ -59,43 +59,7 @@ async def startup_event():
         # 创建事件驱动的Master Agent
         event_agent, event_executor = create_event_driven_master_agent()
         
-        # 🎯 注册表单状态更新处理器
-        async def handle_form_state_update(message: dict, session_id: str):
-            """处理前端表单状态更新"""
-            try:
-                # 获取Master Agent状态
-                agent_state = global_agent_states.get(session_id)
-                if not agent_state:
-                    logger.warning(f"⚠️ 会话 {session_id} 的Agent状态未找到")
-                    return
-                
-                # 确保form_session存在
-                if not hasattr(agent_state, 'form_session') or not agent_state.form_session:
-                    logger.warning(f"⚠️ 会话 {session_id} 的form_session未找到")
-                    return
-                
-                # 更新表单数据
-                form_data = message.get('form_data', {})
-                if 'fields' in form_data:
-                    if not hasattr(agent_state.form_session, 'form_data'):
-                        agent_state.form_session.form_data = {'fields': {}}
-                    elif not agent_state.form_session.form_data:
-                        agent_state.form_session.form_data = {'fields': {}}
-                    elif 'fields' not in agent_state.form_session.form_data:
-                        agent_state.form_session.form_data['fields'] = {}
-                    
-                    # 更新字段
-                    agent_state.form_session.form_data['fields'].update(form_data['fields'])
-                
-                # 更新时间戳
-                agent_state.form_session.updated_at = datetime.now().isoformat()
-                
-                logger.info(f"✅ 表单状态已更新: {session_id}")
-                
-            except Exception as e:
-                logger.error(f"❌ 处理表单状态更新失败: {e}")
-        
-        # 注册处理器
+        # 注册处理器（handle_form_state_update函数定义在文件底部）
         event_router.register_handler("form_state_update_handler", handle_form_state_update)
         event_router.register_handler("user_input_handler", handle_user_input)
         
@@ -223,17 +187,23 @@ async def handle_form_state_update(message: Dict[str, Any], session_id: str):
     try:
         # 获取表单数据更新
         form_data = message.get("form_data", {})
+        logger.info(f"🔍 处理表单状态更新 - 会话: {session_id}")
+        logger.info(f"🔍 接收到的表单数据: {form_data}")
         
         # 更新全局状态
         if session_id not in global_agent_states:
+            logger.info(f"🔍 创建新的会话状态: {session_id}")
             global_agent_states[session_id] = {}
         
         if "form_session" not in global_agent_states[session_id]:
+            logger.info(f"🔍 创建新的表单会话: {session_id}")
             global_agent_states[session_id]["form_session"] = {}
         
         # 更新表单数据
         global_agent_states[session_id]["form_session"]["form_data"] = form_data
         global_agent_states[session_id]["form_session"]["updated_at"] = datetime.now().isoformat()
+        
+        logger.info(f"🔍 更新后的全局状态 - 表单数据: {global_agent_states[session_id]['form_session']['form_data']}")
         
         # 🔥 新增：同时更新历史状态，防止同步循环立即覆盖
         current_form_session = global_agent_states[session_id]["form_session"]
@@ -245,10 +215,12 @@ async def handle_form_state_update(message: Dict[str, Any], session_id: str):
         }
         form_state_history[session_id] = updated_state_summary
         
-        logger.debug(f"✅ 表单状态更新完成: {session_id}")
+        logger.info(f"✅ 表单状态更新完成: {session_id}")
         
     except Exception as e:
         logger.error(f"❌ 处理表单状态更新失败 {session_id}: {e}")
+        import traceback
+        logger.error(f"❌ 错误详情: {traceback.format_exc()}")
 
 
 async def handle_user_input(user_input: str, session_id: str):
