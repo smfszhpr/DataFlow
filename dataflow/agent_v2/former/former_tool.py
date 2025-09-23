@@ -311,7 +311,6 @@ class FormerTool:
                 # 需要收集更多参数，等待用户输入
                 next_instruction = "END"  # 等待用户输入，不继续调用工具
                 force_summary_flag = False  # 不触发summary
-                response_message += f"\n\n请提供以上信息，我将为您准备完整的执行方案。"
             else:  # clarification_needed
                 # 需要澄清需求，等待用户输入
                 next_instruction = "END"  # 等待用户输入，不继续调用工具
@@ -464,45 +463,6 @@ class FormerTool:
                 "requires_user_input": True,
                 "missing_params": missing_params
             }
-        
-        # 🎯 参数验证通过，准备跳转工作流
-        session_data["form_stage"] = "submitted"
-        session_data["form_validated"] = True
-        session_data["waiting_for_input"] = False
-        
-        # 💫 构建工作流执行参数
-        workflow_execution_params = self._build_workflow_params(target_workflow, extracted_params)
-        
-        success_msg = f"""
-✅ **表单提交成功！正在跳转到工作流执行...**
-
-**目标工作流：** {target_workflow}
-**提交时间：** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-📊 **执行参数：**
-{self._format_params_display(extracted_params)}
-
-🚀 **即将启动工作流处理...**
-"""
-        
-        # 🎯 关键：工作流跳转指令
-        return {
-            "success": True,
-            "message": success_msg,
-            "session_id": session_id,
-            "form_stage": "submitted",
-            "form_validated": True,
-            
-            "form_data": extracted_params,
-            "submitted": True,
-            "requires_user_input": False,
-            # 🚀 工作流跳转控制
-            "next_tool_instruction": target_workflow,
-            "workflow_execution_params": workflow_execution_params,
-            "target_workflow": target_workflow,
-            "force_summary": True,
-            "routing_reason": "表单提交完成，跳转到工作流执行"
-        }
         
         # 🎯 参数验证通过，准备跳转工作流
         session_data["form_stage"] = "submitted"

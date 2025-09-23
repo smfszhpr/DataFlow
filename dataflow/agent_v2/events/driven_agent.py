@@ -316,17 +316,48 @@ class EventDrivenMasterAgent:
         
         # 🚀 优化：只处理关键节点的结束事件
         if event_name == "planner":
-            # 检查是否有下一步动作
-            agent_outcome = current_state.get('agent_outcome')
+            # 从事件输出中获取最新的agent_outcome
+            agent_outcome = output_data.get('agent_outcome', [])
             has_next_action = bool(agent_outcome)
             if isinstance(agent_outcome, list):
                 has_next_action = len(agent_outcome) > 0
-                
+
+            # 提取planner决策详细信息
+            reason = None
+            tool_name = None
+            decision_type = "continue" if has_next_action else "finish"
+            
+            # agent_outcome可能是list或dict
+            if isinstance(agent_outcome, list) and agent_outcome:
+                # 取第一个动作的信息
+                first_action = agent_outcome[0]
+                if isinstance(first_action, dict):
+                    reason = first_action.get("reason")
+                    tool_name = first_action.get("tool")
+                elif hasattr(first_action, "tool"):
+                    tool_name = getattr(first_action, "tool", None)
+                    reason = getattr(first_action, "log", None)
+            elif isinstance(agent_outcome, dict):
+                reason = agent_outcome.get("reason")
+                tool_name = agent_outcome.get("tool")
+
+            # 如果reason为空，根据决策类型补充默认原因
+            if not reason:
+                if has_next_action and tool_name:
+                    reason = f"需要执行 {tool_name} 工具"
+                elif has_next_action:
+                    reason = "继续执行下一步操作"
+                else:
+                    reason = "任务分析完成，准备总结"
+
             # 确保event_builder存在再发送事件
             if self.current_event_builder:
                 await self._emit_event(self.current_event_builder.plan_decision({
                     "planning_completed": True,
                     "has_next_action": has_next_action,
+                    "decision_type": decision_type,
+                    "tool_name": tool_name,
+                    "reason": reason
                 }))
             
         elif event_name == "summarize":

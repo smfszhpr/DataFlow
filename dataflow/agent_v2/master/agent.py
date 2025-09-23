@@ -465,6 +465,32 @@ class MasterAgent(SubAgent):
         
         logger.debug(f"📝 简化上下文: 用户输入='{user_input[:50]}...', 工具执行次数={tool_results_count}, 表单会话={has_form_session}")
         
+        # 🔥 新增：优先检查是否存在正在进行的表单收集
+        if form_session:
+            # 检查表单是否需要用户输入
+            requires_user_input = form_session.get('requires_user_input', False)
+            form_stage = form_session.get('form_stage', '')
+            
+            if requires_user_input and form_stage == 'parameter_collection':
+                logger.info(f"🎯 检测到正在进行的表单收集，继续使用former工具处理用户输入")
+                
+                # 直接创建former工具动作，跳过LLM决策
+                single_action = LCAgentAction(
+                    tool="former",
+                    tool_input={
+                        "user_query": user_input,
+                        "action": "collect_user_response",
+                        "session_id": form_session.get('session_id'),
+                        "form_data": form_session.get('form_data', {})
+                    },
+                    log="继续表单收集: 处理用户补充信息"
+                )
+                data["agent_outcome"] = [single_action]
+                data["next_action"] = "continue"
+                
+                logger.info(f"📋 继续表单收集，处理用户输入")
+                return data
+        
         # � 优先检查最近工具的后置建议
         tool_results = data.get("tool_results", [])
         if tool_results:
@@ -515,10 +541,15 @@ class MasterAgent(SubAgent):
                 # 🔧 重要：只创建一个动作
                 next_action = analysis["next_action"]
                 
+                # 🔥 新增：提取LLM的决策原因
+                llm_reasoning = ""
+                if "analysis" in analysis and "llm_decision" in analysis["analysis"]:
+                    llm_reasoning = analysis["analysis"]["llm_decision"].get("reason", "")
+                
                 single_action = LCAgentAction(
                     tool=next_action.get("tool", ""),
                     tool_input=next_action.get("tool_input", {}),
-                    log=f"Planner规划: {next_action.get('tool','')}"
+                    log=llm_reasoning or f"Planner规划: {next_action.get('tool','')}"
                 )
                 
                 data["agent_outcome"] = [single_action]  # 注意：只有一个动作
