@@ -40,14 +40,22 @@ class FormerTool:
         try:
             # 🎯 真正从代码工作流工具中获取参数定义
             from dataflow.agent_v2.subagents.code_workflow_tool import CodeWorkflowToolParams
+            from dataflow.agent_v2.subagents.pipeline_workflow_tool import PipelineWorkflowToolParams
             
             # 通过反射获取真实的参数定义
-            workflow_params = self._extract_params_from_pydantic_model(CodeWorkflowToolParams)
+            code_workflow_params = self._extract_params_from_pydantic_model(CodeWorkflowToolParams)
+            pipeline_workflow_params = self._extract_params_from_pydantic_model(PipelineWorkflowToolParams)
             
             workflows["code_workflow_agent"] = {
                 "description": "代码生成、测试、调试循环工具",
-                "params_schema": workflow_params,
+                "params_schema": code_workflow_params,
                 "tool_class": "CodeWorkflowTool"
+            }
+            
+            workflows["pipeline_workflow_agent"] = {
+                "description": "数据处理流水线推荐工具",
+                "params_schema": pipeline_workflow_params,
+                "tool_class": "PipelineWorkflowTool"
             }
             
             # 可以添加其他工作流的动态发现
@@ -62,6 +70,15 @@ class FormerTool:
                     "requirement": {"required": True, "type": "str", "description": "用户代码需求"}
                 },
                 "tool_class": "CodeWorkflowTool"
+            }
+            workflows["pipeline_workflow_agent"] = {
+                "description": "数据处理流水线推荐工具",
+                "params_schema": {
+                    "json_file": {"required": True, "type": "str", "description": "数据文件路径"},
+                    "target": {"required": True, "type": "str", "description": "用户需求目标"},
+                    "python_file_path": {"required": True, "type": "str", "description": "输出脚本路径"}
+                },
+                "tool_class": "PipelineWorkflowTool"
             }
         
         return workflows
@@ -452,6 +469,19 @@ class FormerTool:
                 "timeout_seconds": extracted_params.get("timeout_seconds", 300),
                 "apikey": extracted_params.get("apikey"),
                 "url": extracted_params.get("url")
+            }
+        elif workflow_name == "pipeline_workflow_agent":
+            # 构建PipelineWorkflow需要的参数格式
+            return {
+                "json_file": extracted_params.get("json_file", ""),
+                "target": extracted_params.get("target", ""),
+                "python_file_path": extracted_params.get("python_file_path", ""),
+                "language": extracted_params.get("language", "zh"),
+                "chat_api_url": extracted_params.get("chat_api_url"),
+                "api_key": extracted_params.get("api_key"),
+                "model": extracted_params.get("model", "gpt-4o"),
+                "need_debug": extracted_params.get("need_debug", True),
+                "max_debug_rounds": extracted_params.get("max_debug_rounds", 3)
             }
         else:
             # 其他工作流的参数构建逻辑

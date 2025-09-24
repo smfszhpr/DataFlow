@@ -37,6 +37,7 @@ from dataflow.agent_v2.subagents.mock_tools import SleepTool
 from dataflow.agent_v2.subagents.csvtools import CSVProfileTool, CSVDetectTimeColumnsTool, CSVVegaSpecTool, ASTStaticCheckTool, UnitTestStubTool, LocalIndexBuildTool, LocalIndexQueryTool
 from dataflow.agent_v2.former.former_tool import FormerTool
 from dataflow.agent_v2.subagents.code_workflow_tool import CodeWorkflowTool
+from dataflow.agent_v2.subagents.pipeline_workflow_tool import PipelineWorkflowTool
 from dataflow.agent_v2.subagents.continue_chat_tool import ContinueChatTool
 
 from concurrent.futures import ThreadPoolExecutor
@@ -144,6 +145,7 @@ class MasterAgent(SubAgent):
                 # 主要工作流工具
                 FormerTool(),
                 CodeWorkflowTool(),
+                PipelineWorkflowTool(),
                 # 其他Mock工具用于测试多轮编排
                 SleepTool(),
                 CSVProfileTool(), 
