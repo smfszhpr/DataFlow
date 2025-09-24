@@ -304,11 +304,6 @@ async def handle_user_input(user_input: str, session_id: str):
         
         logger.info(f"🎯 开始处理用户输入: {user_input} (会话: {session_id})")
         
-        # 🔥 调试：检查全局状态
-        logger.info(f"🔍 WebSocket调试 - global_agent_states中的会话: {list(global_agent_states.keys())}")
-        logger.info(f"🔍 WebSocket调试 - 当前会话ID: {session_id}")
-        logger.info(f"🔍 WebSocket调试 - 会话存在检查: {session_id in global_agent_states}")
-        
         # 🔥 新增：构建初始状态，包含现有的表单状态
         initial_state = {
             "input": user_input,

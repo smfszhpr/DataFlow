@@ -7,7 +7,7 @@ import logging
 from typing import Dict, List, Any, Optional
 
 from dataflow.serving import APILLMServing_request
-from dataflow.agent.eventengine.config_manager import get_llm_config
+from dataflow.agent_v2.config import get_llm_config
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +16,8 @@ class LLMClient:
     """LLM客户端，使用DataFlow现有的LLM服务"""
     
     def __init__(self):
+        """初始化LLM客户端"""
+        # 使用agent_v2自己的配置
         self.llm_config = get_llm_config()
         self.api_available = bool(self.llm_config.api_key and self.llm_config.api_url)
         

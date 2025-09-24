@@ -36,7 +36,7 @@ from dataflow.agent_v2.llm_client import get_llm_client
 from dataflow.agent_v2.subagents.apikey_agent import APIKeyTool
 from dataflow.agent_v2.subagents.mock_tools import SleepTool
 from dataflow.agent_v2.subagents.csvtools import CSVProfileTool, CSVDetectTimeColumnsTool, CSVVegaSpecTool, ASTStaticCheckTool, UnitTestStubTool, LocalIndexBuildTool, LocalIndexQueryTool
-from dataflow.agent_v2.former.former_tool import FormerTool
+from dataflow.agent_v2.subagents.former_tool import FormerTool
 from dataflow.agent_v2.subagents.code_workflow_tool import CodeWorkflowTool
 from dataflow.agent_v2.subagents.pipeline_workflow_tool import PipelineWorkflowTool
 from dataflow.agent_v2.subagents.continue_chat_tool import ContinueChatTool
@@ -49,7 +49,7 @@ def to_langchain_tool(tool: BaseTool) -> StructuredTool:
     async def _arun(**kwargs):
         # 对于Former工具，特殊处理参数转换
         if tool.name() == "former":
-            from dataflow.agent_v2.former.former_tool import FormerToolParams
+            from dataflow.agent_v2.subagents.former_tool import FormerToolParams
             params = FormerToolParams(**kwargs)
             return tool.execute(params)  # FormerTool是同步的
         else:
@@ -266,67 +266,7 @@ class MasterAgent(SubAgent):
                 # 统一使用tool_executor处理所有工具调用，确保触发LangGraph事件
                 result = await self.tool_executor.ainvoke(action)
                 
-                # 特殊处理former工具的会话状态和跳转指令
-                if action.tool == "former" and isinstance(result, dict):
-                    # 更新 form_session 到 AgentState
-                    if result.get("session_id"):
-                        data["form_session"] = {
-                            "session_id": result["session_id"],
-                            "form_data": {"fields": result.get("form_data", {})},  # 包装在fields中以保持兼容性
-                            "form_stage": result.get("form_stage"),
-                            "requires_user_input": result.get("requires_user_input", True),
-                            "target_workflow": result.get("target_workflow", "")  # 🔥 保存目标工作流
-                        }
-                    
-                    # 🔥 关键修复：如果former需要等待用户输入，直接结束流程
-                    if result.get("requires_user_input") is True:
-                        logger.info("🛑 Former工具需要等待用户输入，直接结束流程")
-                        
-                        # 记录到intermediate_steps - 在提前返回之前保存
-                        if not data.get("intermediate_steps"):
-                            data["intermediate_steps"] = []
-                        data["intermediate_steps"].append((action, result))
-                        
-                        # 记录到tool_results
-                        data["tool_results"].append({
-                            "tool": action.tool,
-                            "ok": bool(result.get("success", True)) if isinstance(result, dict) else True,
-                            "payload": result
-                        })
-                        
-                        # 🔥 新增：立即同步到全局状态 (前置到提前返回之前)
-                        try:
-                            from ..websocket.server import global_agent_states
-                            # 尝试从多个位置获取session_id
-                            session_id = data.get('session_id') or getattr(data, 'session_id', None)
-                            if not session_id:
-                                # 从agent_metadata获取
-                                agent_metadata = data.get('agent_metadata')
-                                if agent_metadata and hasattr(agent_metadata, 'session_id'):
-                                    session_id = agent_metadata.session_id
-                                elif agent_metadata and isinstance(agent_metadata, dict):
-                                    session_id = agent_metadata.get('session_id')
-                            
-                            logger.info(f"🔍 尝试同步(former等待输入)，session_id: {session_id}")
-                            
-                            if session_id and session_id in global_agent_states:
-                                # 更新global_agent_states中的tool_results
-                                global_agent_states[session_id]["tool_results"] = data["tool_results"]
-                                if "form_session" in data:
-                                    global_agent_states[session_id]["form_session"] = data["form_session"]
-                                logger.info(f"🔄 已同步AgentState到全局状态(former等待): {session_id}")
-                            else:
-                                logger.warning(f"⚠️ 无法同步: session_id={session_id}, keys={list(global_agent_states.keys()) if global_agent_states else 'None'}")
-                        except Exception as sync_error:
-                            logger.warning(f"⚠️ 同步到全局状态失败: {sync_error}")
-                            import traceback
-                            logger.warning(traceback.format_exc())
-                        
-                        # 使用former的输出作为最终结果
-                        data["final_result"] = result.get("message", "等待用户进一步输入")
-                        data["agent_outcome"] = []  # 清空，表示结束
-                        data["next_action"] = "finish"
-                        return data
+
                 
                 # 记录到intermediate_steps
                 if not data.get("intermediate_steps"):
@@ -339,6 +279,60 @@ class MasterAgent(SubAgent):
                     "ok": bool(result.get("success", True)) if isinstance(result, dict) else True,
                     "payload": result
                 })
+                
+                # 🎯 统一工具结果适配（实验性转为正式功能）
+                try:
+                    from dataflow.agent_v2.tool_result import adapt_tool_result, ToolStatus
+                    unified_result = adapt_tool_result(action.tool, result)
+                    logger.info(f"🔄 工具结果已适配: {action.tool} -> {unified_result.status}")
+                    
+                    # 存储统一格式结果
+                    data.setdefault("unified_tool_results", []).append(unified_result.model_dump())
+                    
+                    # 🎯 新逻辑：根据ToolResult状态统一处理，而不是特殊判断former
+                    if unified_result.status == ToolStatus.NEED_USER_INPUT:
+                        logger.info(f"🛑 工具 {action.tool} 需要等待用户输入，结束流程")
+                        
+                        # 特殊处理former的form_session更新（保持向后兼容）
+                        if action.tool == "former" and isinstance(result, dict):
+                            if result.get("session_id"):
+                                data["form_session"] = {
+                                    "session_id": result["session_id"],
+                                    "form_data": {"fields": result.get("form_data", {})},
+                                    "form_stage": result.get("form_stage"),
+                                    "requires_user_input": result.get("requires_user_input", True),
+                                    "target_workflow": result.get("target_workflow", "")
+                                }
+                        
+                        # 🔥 立即同步到全局状态
+                        try:
+                            from ..websocket.server import global_agent_states
+                            session_id = data.get('session_id') or getattr(data, 'session_id', None)
+                            if not session_id:
+                                agent_metadata = data.get('agent_metadata')
+                                if agent_metadata and hasattr(agent_metadata, 'session_id'):
+                                    session_id = agent_metadata.session_id
+                                elif agent_metadata and isinstance(agent_metadata, dict):
+                                    session_id = agent_metadata.get('session_id')
+                            
+                            if session_id and session_id in global_agent_states:
+                                global_agent_states[session_id]["tool_results"] = data["tool_results"]
+                                if "form_session" in data:
+                                    global_agent_states[session_id]["form_session"] = data["form_session"]
+                                logger.info(f"🔄 已同步AgentState到全局状态(等待用户输入): {session_id}")
+                        except Exception as sync_error:
+                            logger.warning(f"⚠️ 同步到全局状态失败: {sync_error}")
+                        
+                        # 使用统一结果消息作为最终结果
+                        data["final_result"] = unified_result.message
+                        data["agent_outcome"] = []
+                        data["next_action"] = "finish"
+                        return data
+                        
+                except ImportError:
+                    logger.debug("📝 统一工具结果适配器不可用，使用传统逻辑")
+                except Exception as adapter_error:
+                    logger.warning(f"⚠️ 工具结果适配失败: {adapter_error}")
                 
                 # 🎯 新增：提取和存储生成的代码到state中（用于前端标签页）
                 # 检查多个可能的代码字段
@@ -431,33 +425,46 @@ class MasterAgent(SubAgent):
                     import traceback
                     logger.warning(traceback.format_exc())
                 
-                # 🗑️ 新增：如果执行的是非former工具，清除表单状态和final_result
-                if action.tool != "former":
-                    if data.get("form_session"):
-                        logger.info(f"🗑️ 工作流工具 {action.tool} 执行完成，清除表单状态")
-                        data["form_session"] = None
-                    
-                    if data.get("final_result"):
-                        logger.info(f"🗑️ 工作流工具 {action.tool} 执行完成，清除final_result")
-                        data["final_result"] = None
-                    
-                    # 同时清除全局状态中的表单
-                    try:
-                        # 获取session_id
-                        session_id = data.get('session_id')
-                        if not session_id:
-                            agent_metadata = data.get('agent_metadata')
-                            if agent_metadata and hasattr(agent_metadata, 'session_id'):
-                                session_id = agent_metadata.session_id
-                            elif agent_metadata and isinstance(agent_metadata, dict):
-                                session_id = agent_metadata.get('session_id')
+                # 🗑️ 统一逻辑：根据ToolResult状态判断是否清除表单状态
+                try:
+                    # 如果有unified_result且不是NEED_USER_INPUT，清除表单状态
+                    if ('unified_tool_results' in data and 
+                        data['unified_tool_results'] and 
+                        data['unified_tool_results'][-1].get('status') != 'NEED_USER_INPUT'):
                         
-                        if session_id and session_id in global_agent_states:
-                            if "form_session" in global_agent_states[session_id]:
-                                del global_agent_states[session_id]["form_session"]
-                                logger.info(f"🗑️ 已清除全局状态中的表单: {session_id}")
-                    except Exception as clear_error:
-                        logger.warning(f"⚠️ 清除全局表单状态失败: {clear_error}")
+                        if data.get("form_session"):
+                            logger.info(f"🗑️ 工具 {action.tool} 执行完成，清除表单状态")
+                            data["form_session"] = None
+                        
+                        if data.get("final_result"):
+                            logger.info(f"🗑️ 工具 {action.tool} 执行完成，清除final_result")
+                            data["final_result"] = None
+                        
+                        # 同时清除全局状态中的表单
+                        try:
+                            from ..websocket.server import global_agent_states
+                            session_id = data.get('session_id')
+                            if not session_id:
+                                agent_metadata = data.get('agent_metadata')
+                                if agent_metadata and hasattr(agent_metadata, 'session_id'):
+                                    session_id = agent_metadata.session_id
+                                elif agent_metadata and isinstance(agent_metadata, dict):
+                                    session_id = agent_metadata.get('session_id')
+                            
+                            if session_id and session_id in global_agent_states:
+                                if "form_session" in global_agent_states[session_id]:
+                                    del global_agent_states[session_id]["form_session"]
+                                    logger.info(f"🗑️ 已清除全局状态中的表单: {session_id}")
+                        except Exception as clear_error:
+                            logger.warning(f"⚠️ 清除全局表单状态失败: {clear_error}")
+                except Exception as clear_error:
+                    # 如果统一逻辑失败，回退到原有逻辑（向后兼容）
+                    logger.debug(f"🔄 统一清理逻辑失败，使用传统方式: {clear_error}")
+                    if action.tool != "former":
+                        if data.get("form_session"):
+                            data["form_session"] = None
+                        if data.get("final_result"):
+                            data["final_result"] = None
                 
             except Exception as e:
                 import traceback
@@ -876,44 +883,17 @@ class MasterAgent(SubAgent):
 
             logger.info(f"🚀 准备调用LLM，user_prompt长度: {len(user_prompt)}")
             
-            # 调用LLM生成智能总结 - 增加超时控制
+            # 使用LLMClient的异步调用方法
             try:
+                result = await self.llm.call_llm_async(system_prompt, user_prompt)
                 
-                
-                def sync_llm_call():
-                    try:
-                        llm_service = self.llm._create_llm_service()
-                        # 减少重试次数避免长时间阻塞
-                        llm_service.max_retries = 1
-                        return llm_service.generate_from_input(
-                            user_inputs=[user_prompt],
-                            system_prompt=system_prompt
-                        )
-                    except Exception as e:
-                        logger.error(f"LLM服务内部错误: {e}")
-                        return None
-                
-                # 异步执行，设置5秒超时
-                with ThreadPoolExecutor() as executor:
-                    future = executor.submit(sync_llm_call)
-                    try:
-                        responses = await asyncio.wait_for(
-                            asyncio.wrap_future(future), 
-                            timeout=50.0
-                        )
-                        
-                        if responses and responses[0]:
-                            llm_response = responses[0].strip()
-                            logger.info(f"🤖 LLM智能总结生成成功: {llm_response[:100]}...")
-                            return llm_response
-                        else:
-                            logger.warning("⚠️ LLM返回空响应，使用fallback")
-                            
-                    except asyncio.TimeoutError:
-                        logger.warning("⚠️ LLM调用超时（5秒），使用fallback")
-                    except Exception as e:
-                        logger.error(f"LLM异步调用错误: {e}")
-                        
+                if result and result.get("content"):
+                    llm_response = result["content"].strip()
+                    logger.info(f"🤖 LLM智能总结生成成功: {llm_response[:100]}...")
+                    return llm_response
+                else:
+                    logger.warning("⚠️ LLM返回空响应")
+                    
             except Exception as e:
                 logger.error(f"LLM智能总结调用失败: {e}")
                 import traceback
@@ -1081,7 +1061,6 @@ class MasterAgent(SubAgent):
     "decision": "continue" 或 "finish",
     "tool": "工具名称（仅当decision为continue时）",
     "tool_input": {"参数名": "参数值"},
-    "finish_message": "任务完成说明（仅当decision为finish时）",
     "reason": "简短的决策原因"
 }"""
 
@@ -1099,15 +1078,11 @@ class MasterAgent(SubAgent):
 
             logger.info(f"🤖 调用LLM进行智能决策...")
             
-            # 调用LLM进行决策 - 使用基础调用方式
-            llm_service = self.llm._create_llm_service()
-            responses = llm_service.generate_from_input(
-                user_inputs=[user_prompt],
-                system_prompt=system_prompt
-            )
+            # 使用LLMClient的同步调用方法
+            result = self.llm.call_llm(system_prompt, user_prompt)
             
-            if responses and responses[0]:
-                content = responses[0].strip()
+            if result and result.get("content"):
+                content = result["content"].strip()
                 logger.info(f"🤖 LLM决策响应: {content}")
                 
                 # 尝试清理JSON格式 - 移除可能的markdown代码块标记
@@ -1125,7 +1100,6 @@ class MasterAgent(SubAgent):
                     decision_type = decision.get("decision", "finish")
                     tool_name = decision.get("tool")
                     tool_input = decision.get("tool_input", {})
-                    finish_message = decision.get("finish_message", "")
                     reasoning = decision.get("reason", "")
                     
                     # 判断是否继续
@@ -1148,7 +1122,7 @@ class MasterAgent(SubAgent):
                     result = {
                         "should_continue": should_continue,
                         "next_action": next_action,
-                        "reasons": [reasoning or finish_message],
+                        "reasons": [reasoning],
                         "analysis": {
                             "decision_type": decision_type,
                             "llm_decision": decision,
