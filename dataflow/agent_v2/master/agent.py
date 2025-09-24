@@ -4,6 +4,7 @@ DataFlow Master Agent
 """
 import logging
 import asyncio
+import os
 import time
 import uuid
 import json
@@ -85,6 +86,10 @@ class AgentState(TypedDict, total=False):
     form_session: Optional[Dict[str, Any]]  # FormerTool表单会话状态，统一存储到Master Agent
     xml_content: Optional[str]
     
+    # 前端标签页内容
+    generated_code: Optional[str]  # 生成的代码内容，用于前端代码标签页
+    code_metadata: Optional[Dict[str, Any]]  # 代码元数据（文件名、语言等）
+    
     execution_result: Optional[str]
     conversation_history: List[Dict[str, str]]  # 对话历史
     last_tool_results: Optional[Dict[str, Any]]  # 最近的工具结果
@@ -139,14 +144,11 @@ class MasterAgent(SubAgent):
     def _register_tools(self):
         """注册工具"""
         try:
-            # 导入Former工具（从former文件夹）
             self.tools = [
                 APIKeyTool(),
-                # 主要工作流工具
                 FormerTool(),
                 CodeWorkflowTool(),
                 PipelineWorkflowTool(),
-                # 其他Mock工具用于测试多轮编排
                 SleepTool(),
                 CSVProfileTool(), 
                 CSVDetectTimeColumnsTool(), 
@@ -213,7 +215,6 @@ class MasterAgent(SubAgent):
     @staticmethod
     async def entry(data):
         """入口点 - 直接路由到planner进行统一决策"""
-        logger.info("🚪 进入Master Agent入口点，直接路由到planner")
         return "planner"
     
     @node
@@ -339,6 +340,66 @@ class MasterAgent(SubAgent):
                     "payload": result
                 })
                 
+                # 🎯 新增：提取和存储生成的代码到state中（用于前端标签页）
+                # 检查多个可能的代码字段
+                code_content = ""
+                code_metadata = {}
+                
+                if isinstance(result, dict):
+                    # 优先使用 frontend_code_data 结构
+                    if result.get("frontend_code_data"):
+                        code_data = result["frontend_code_data"]
+                        code_content = code_data.get("code_content", "")
+                        code_metadata = {
+                            "file_name": code_data.get("file_name", "generated_code.py"),
+                            "file_path": code_data.get("file_path", ""),
+                            "language": code_data.get("language", "python"),
+                            "tool_source": code_data.get("tool_source", action.tool),
+                            "timestamp": code_data.get("timestamp"),
+                            "last_updated": asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else None
+                        }
+                    
+                    # 备选：使用 generated_pipeline_code
+                    elif result.get("generated_pipeline_code"):
+                        code_content = result["generated_pipeline_code"]
+                        # 从其他字段推断元数据
+                        file_path = ""
+                        if action.tool == "pipeline_workflow_agent" and hasattr(action, 'tool_input'):
+                            file_path = action.tool_input.get("python_file_path", "")
+                        
+                        code_metadata = {
+                            "file_name": os.path.basename(file_path) if file_path else "generated_code.py",
+                            "file_path": file_path,
+                            "language": "python",
+                            "tool_source": action.tool,
+                            "timestamp": asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else None,
+                            "last_updated": asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else None
+                        }
+                
+                # 如果有代码内容，存储到state
+                if code_content:
+                    # 将代码存储为列表格式（支持多个代码文件）
+                    if not data.get("generated_code"):
+                        data["generated_code"] = []
+                    if not data.get("code_metadata"):
+                        data["code_metadata"] = {}
+                    
+                    # 创建代码项
+                    code_item = {
+                        "content": code_content,
+                        "filename": code_metadata.get("file_name", "generated_code.py"),
+                        "language": code_metadata.get("language", "python"),
+                        "tool_source": code_metadata.get("tool_source", action.tool),
+                        "timestamp": code_metadata.get("timestamp"),
+                        "file_path": code_metadata.get("file_path", "")
+                    }
+                    
+                    data["generated_code"].append(code_item)
+                    data["code_metadata"]["last_updated"] = code_metadata.get("last_updated")
+                    data["code_metadata"]["total_files"] = len(data["generated_code"])
+                    
+
+                
                 # 🔥 新增：立即同步到全局状态 (用于WebSocket前端显示)
                 try:
                     from ..websocket.server import global_agent_states
@@ -359,6 +420,11 @@ class MasterAgent(SubAgent):
                         global_agent_states[session_id]["tool_results"] = data["tool_results"]
                         if "form_session" in data:
                             global_agent_states[session_id]["form_session"] = data["form_session"]
+                        # 🎯 同步代码数据到全局状态
+                        if "generated_code" in data:
+                            global_agent_states[session_id]["generated_code"] = data["generated_code"]
+                        if "code_metadata" in data:
+                            global_agent_states[session_id]["code_metadata"] = data["code_metadata"]
                         logger.info(f"🔄 已同步AgentState到全局状态: {session_id}")
                 except Exception as sync_error:
                     logger.warning(f"⚠️ 同步到全局状态失败: {sync_error}")
@@ -394,7 +460,6 @@ class MasterAgent(SubAgent):
                         logger.warning(f"⚠️ 清除全局表单状态失败: {clear_error}")
                 
             except Exception as e:
-                logger.error(f"❌ 工具执行失败: {action.tool}, 错误: {e}")
                 import traceback
                 logger.error(f"❌ 详细错误信息:\n{traceback.format_exc()}")
                 err = {"success": False, "error": str(e)}
@@ -404,7 +469,6 @@ class MasterAgent(SubAgent):
                 data["tool_results"].append({"tool": action.tool, "ok": False, "payload": err})
         # 清空agent_outcome，避免重复执行
         data["agent_outcome"] = []
-        logger.info(f"🔄 工具执行完成，清空agent_outcome，进入planner节点")
         return data
     
     @node
@@ -429,11 +493,8 @@ class MasterAgent(SubAgent):
 
         # 简化的上下文信息
         user_input = data.get('input', '')
-        tool_results_count = len(data.get('tool_results', []))
         form_session = data.get('form_session')
-        has_form_session = bool(form_session)
-        
-        logger.debug(f"📝 简化上下文: 用户输入='{user_input[:50]}...', 工具执行次数={tool_results_count}, 表单会话={has_form_session}")
+
         
         # 🔥 新增：优先检查是否存在正在进行的表单收集
         if form_session:
@@ -442,8 +503,6 @@ class MasterAgent(SubAgent):
             form_stage = form_session.get('form_stage', '')
             
             if requires_user_input and form_stage == 'parameter_collection':
-                logger.info(f"🎯 检测到正在进行的表单收集，继续使用former工具处理用户输入")
-                
                 # 直接创建former工具动作，跳过LLM决策
                 single_action = LCAgentAction(
                     tool="former",
@@ -458,7 +517,6 @@ class MasterAgent(SubAgent):
                 data["agent_outcome"] = [single_action]
                 data["next_action"] = "continue"
                 
-                logger.info(f"📋 继续表单收集，处理用户输入")
                 return data
         
         # � 优先检查最近工具的后置建议

@@ -61,6 +61,7 @@ async def startup_event():
         
         # 注册处理器（handle_form_state_update函数定义在文件底部）
         event_router.register_handler("form_state_update_handler", handle_form_state_update)
+        event_router.register_handler("code_state_update_handler", handle_code_state_update)
         event_router.register_handler("user_input_handler", handle_user_input)
         
         # 启动状态同步定时器
@@ -100,9 +101,14 @@ async def sync_form_states_to_clients():
             
             # 🎯 修复：处理不同的状态结构
             form_session = None
+            generated_code = None
+            code_metadata = None
+            
             if isinstance(state, dict):
                 form_session = state.get("form_session", {})
-                logger.debug(f"🔍 从dict state提取form_session: {form_session}")
+                generated_code = state.get("generated_code", [])
+                code_metadata = state.get("code_metadata", {})
+                logger.debug(f"🔍 从dict state提取数据 - form_session keys: {list(form_session.keys()) if form_session else []}, generated_code count: {len(generated_code) if generated_code else 0}")
                 # 🔥 新增：如果AgentState中有tool_results，提取former的missing_params
                 if "tool_results" in state:
                     logger.debug(f"🔍 检查tool_results，数量: {len(state['tool_results'])}")
@@ -132,6 +138,9 @@ async def sync_form_states_to_clients():
                     "form_stage": getattr(state.form_session, 'form_stage', 'initial') if state.form_session else 'initial',
                     "updated_at": getattr(state.form_session, 'updated_at', datetime.now().isoformat()) if state.form_session else datetime.now().isoformat()
                 }
+                # 提取代码数据
+                generated_code = getattr(state, 'generated_code', [])
+                code_metadata = getattr(state, 'code_metadata', {})
                 # 🔥 新增：提取missing_params
                 if hasattr(state, 'tool_results'):
                     for tool_result in state.tool_results:
@@ -142,14 +151,16 @@ async def sync_form_states_to_clients():
                             if payload.get("extracted_params"):
                                 form_session["extracted_params"] = payload["extracted_params"]
             
-            # 🔥 新增：检测表单状态是否有实际变化
-            if form_session:
+            # 🔥 新增：检测状态是否有实际变化（表单或代码）
+            if form_session or generated_code:
                 # 生成状态摘要用于比较
                 current_state_summary = {
-                    "missing_params": form_session.get("missing_params", []),
-                    "extracted_params": form_session.get("extracted_params", {}),
-                    "form_data": form_session.get("form_data", {"fields": {}}),
-                    "form_stage": form_session.get("form_stage", "initial")
+                    "missing_params": form_session.get("missing_params", []) if form_session else [],
+                    "extracted_params": form_session.get("extracted_params", {}) if form_session else {},
+                    "form_data": form_session.get("form_data", {"fields": {}}) if form_session else {"fields": {}},
+                    "form_stage": form_session.get("form_stage", "initial") if form_session else "initial",
+                    "generated_code_count": len(generated_code) if generated_code else 0,
+                    "code_metadata": code_metadata if code_metadata else {}
                 }
                 
                 # 检查是否与历史状态相同
@@ -162,22 +173,34 @@ async def sync_form_states_to_clients():
                 # 更新历史状态
                 form_state_history[session_id] = current_state_summary
                 
-                logger.debug(f"🔍 发送表单状态同步到会话: {session_id}")
+                logger.debug(f"🔍 发送状态同步到会话: {session_id} (表单:{bool(form_session)}, 代码:{len(generated_code) if generated_code else 0}项)")
                 
-                # 发送表单状态更新事件
+                # 发送状态更新事件 - 包含表单和代码数据
                 ws_sink = await connection_manager.get_connection(session_id)
                 if ws_sink:
                     try:
+                        # 准备发送数据
+                        sync_data = {
+                            "type": "state_sync",
+                        }
+                        
+                        # 添加表单数据（如果存在）
+                        if form_session:
+                            sync_data["form_session"] = form_session
+                        
+                        # 添加代码数据（如果存在）
+                        if generated_code:
+                            sync_data["generated_code"] = generated_code
+                            sync_data["code_metadata"] = code_metadata
+                            logger.debug(f"🔍 发送代码数据: {len(generated_code)} 项")
+                        
                         await ws_sink.emit(Event(
                             type=EventType.STATE_UPDATE,
                             session_id=session_id,
                             timestamp=datetime.now(),
-                            data={
-                                "type": "form_state_sync",
-                                "form_session": form_session
-                            }
+                            data=sync_data
                         ))
-                        logger.debug(f"🔄 表单状态已同步: {session_id}")
+                        logger.debug(f"🔄 状态已同步: {session_id}")
                     except Exception as e:
                         logger.error(f"❌ 发送表单状态失败 {session_id}: {e}")
 
@@ -219,6 +242,43 @@ async def handle_form_state_update(message: Dict[str, Any], session_id: str):
         
     except Exception as e:
         logger.error(f"❌ 处理表单状态更新失败 {session_id}: {e}")
+        import traceback
+        logger.error(f"❌ 错误详情: {traceback.format_exc()}")
+
+
+async def handle_code_state_update(message: Dict[str, Any], session_id: str):
+    """处理前端代码状态更新"""
+    try:
+        # 获取代码数据更新
+        code_updates = message.get("code_updates", [])
+        code_metadata = message.get("code_metadata", {})
+        logger.info(f"🔍 处理代码状态更新 - 会话: {session_id}")
+        logger.info(f"🔍 接收到的代码更新: {len(code_updates)} 项")
+        
+        # 更新全局状态
+        if session_id not in global_agent_states:
+            logger.info(f"🔍 创建新的会话状态: {session_id}")
+            global_agent_states[session_id] = {}
+        
+        # 更新代码数据
+        global_agent_states[session_id]["generated_code"] = code_updates
+        global_agent_states[session_id]["code_metadata"] = code_metadata
+        
+        # 更新历史状态，防止同步循环立即覆盖
+        current_state_summary = {
+            "missing_params": global_agent_states[session_id].get("form_session", {}).get("missing_params", []),
+            "extracted_params": global_agent_states[session_id].get("form_session", {}).get("extracted_params", {}),
+            "form_data": global_agent_states[session_id].get("form_session", {}).get("form_data", {"fields": {}}),
+            "form_stage": global_agent_states[session_id].get("form_session", {}).get("form_stage", "initial"),
+            "generated_code_count": len(code_updates),
+            "code_metadata": code_metadata
+        }
+        form_state_history[session_id] = current_state_summary
+        
+        logger.info(f"✅ 代码状态更新完成: {session_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ 处理代码状态更新失败 {session_id}: {e}")
         import traceback
         logger.error(f"❌ 错误详情: {traceback.format_exc()}")
 

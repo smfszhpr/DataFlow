@@ -198,6 +198,14 @@ class WebSocketEventRouter:
                 else:
                     logger.warning("⚠️ form_state_update_handler 处理器未注册")
             
+            elif msg_type == "code_state_update":
+                # 🎯 处理前端代码状态更新
+                if "code_state_update_handler" in self.handlers:
+                    handler = self.handlers["code_state_update_handler"]
+                    asyncio.create_task(handler(message, session_id))
+                else:
+                    logger.warning("⚠️ code_state_update_handler 处理器未注册")
+            
             else:
                 logger.warning(f"⚠️ 未知消息类型: {msg_type}")
         

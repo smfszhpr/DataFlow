@@ -27,6 +27,7 @@ class DFState:
     agent_results: Dict[str, Any] = field(default_factory=dict)
     category: Dict[str, Any] = field(default_factory=dict)
     recommendation: Dict[str, Any] = field(default_factory=dict)
+    pipeline_code: Dict[str, Any] = field(default_factory=dict)  # 生成的流水线代码
     temp_data: Dict[str, Any] = field(default_factory=dict) # 供 Agent 之间传递临时数据，不伴随整个生命周期，可以随时clear；
     debug_mode: bool = True
     execution_result: Dict[str, Any] = field(default_factory=dict)

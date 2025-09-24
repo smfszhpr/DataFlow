@@ -120,6 +120,25 @@ class PipelineWorkflowTool(BaseTool):
                 # 执行完整工作流
                 final_state = await pipeline_graph.ainvoke(df_state)
                 
+                # ===== DEBUG: 打印 final_state 的关键信息 =====
+                logger.info("🔍 DEBUG: 查看 final_state 的内容...")
+                logger.info(f"📋 final_state 类型: {type(final_state)}")
+                logger.info(f"📋 final_state 属性: {dir(final_state) if hasattr(final_state, '__dict__') else 'N/A'}")
+                
+                # 尝试不同方式获取 pipeline_code
+                pipeline_code_from_attr = getattr(final_state, 'pipeline_code', None)
+                pipeline_code_from_get = final_state.get('pipeline_code', None) if hasattr(final_state, 'get') else None
+                pipeline_code_from_temp = final_state.get('temp_data', {}).get('pipeline_code', None) if hasattr(final_state, 'get') else None
+                
+                logger.info(f"🔍 pipeline_code (直接属性): {type(pipeline_code_from_attr)} = {pipeline_code_from_attr}")
+                logger.info(f"🔍 pipeline_code (get方法): {type(pipeline_code_from_get)} = {pipeline_code_from_get}")
+                logger.info(f"🔍 pipeline_code (temp_data): {type(pipeline_code_from_temp)} = {pipeline_code_from_temp}")
+                
+                # 如果有 temp_data，打印完整内容
+                if hasattr(final_state, 'temp_data'):
+                    temp_data = getattr(final_state, 'temp_data', {})
+                    logger.info(f"🔍 temp_data 内容: {temp_data}")
+                
                 # 提取结果
                 execution_result = final_state.get("execution_result", {})
                 execution_successful = execution_result.get("success", False)
@@ -130,12 +149,44 @@ class PipelineWorkflowTool(BaseTool):
                 classification_result = final_state.get("category", {})
                 recommendation_result = final_state.get("recommendation", [])
                 
-                # 提取生成的代码
-                pipeline_code_result = final_state.get("pipeline_code", {})
-                if isinstance(pipeline_code_result, dict):
-                    generated_code = pipeline_code_result.get("code", "")
+                # 提取生成的代码 - 优先从不同地方尝试获取
+                generated_code = ""
+                
+                # 方法1：直接从 pipeline_code 属性
+                if pipeline_code_from_attr:
+                    if isinstance(pipeline_code_from_attr, dict):
+                        generated_code = pipeline_code_from_attr.get("code", str(pipeline_code_from_attr))
+                    else:
+                        generated_code = str(pipeline_code_from_attr)
+                    logger.info(f"✅ 方法1成功获取代码，长度: {len(generated_code)}")
+                
+                # 方法2：从 get 方法
+                elif pipeline_code_from_get:
+                    if isinstance(pipeline_code_from_get, dict):
+                        generated_code = pipeline_code_from_get.get("code", str(pipeline_code_from_get))
+                    else:
+                        generated_code = str(pipeline_code_from_get)
+                    logger.info(f"✅ 方法2成功获取代码，长度: {len(generated_code)}")
+                
+                # 方法3：从 temp_data
+                elif pipeline_code_from_temp:
+                    generated_code = str(pipeline_code_from_temp)
+                    logger.info(f"✅ 方法3成功获取代码，长度: {len(generated_code)}")
+                
                 else:
-                    generated_code = str(pipeline_code_result)
+                    logger.warning("❌ 所有方法都未能获取到 pipeline_code")
+                    # 尝试从 pipeline_file_path 读取文件
+                    if hasattr(final_state, 'pipeline_file_path'):
+                        pipeline_file = getattr(final_state, 'pipeline_file_path', '')
+                        if pipeline_file and os.path.exists(pipeline_file):
+                            try:
+                                with open(pipeline_file, 'r', encoding='utf-8') as f:
+                                    generated_code = f.read()
+                                logger.info(f"✅ 从文件 {pipeline_file} 读取代码，长度: {len(generated_code)}")
+                            except Exception as e:
+                                logger.warning(f"❌ 从文件读取失败: {e}")
+                
+                logger.info(f"🎯 最终获取的代码预览 (前100字符): {generated_code[:100]}...")
                 
                 # 构建详细结果
                 if execution_successful:
@@ -217,7 +268,16 @@ class PipelineWorkflowTool(BaseTool):
                     "generated_pipeline_code": generated_code,
                     "classification_result": classification_result,
                     "recommendation_result": recommendation_result,
-                    "workflow_result": output
+                    "workflow_result": output,
+                    # 🎯 新增：用于前端标签页的数据
+                    "frontend_code_data": {
+                        "code_content": generated_code,
+                        "file_name": os.path.basename(python_file_path),
+                        "file_path": python_file_path,
+                        "language": "python",
+                        "tool_source": "pipeline_workflow_agent",
+                        "timestamp": asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else None
+                    }
                 }
                 
             except Exception as dataflow_error:
