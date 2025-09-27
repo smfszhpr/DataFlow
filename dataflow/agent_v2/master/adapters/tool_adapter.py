@@ -1,5 +1,5 @@
 """
-统一的工具结果规范 - 避免对特定工具的特判
+统一的工具结果适配器 - 避免对特定工具的特判
 """
 from enum import Enum
 from typing import Dict, Any, List, Optional
@@ -46,9 +46,6 @@ class ToolResult(BaseModel):
     
     # 后续建议
     followup: Optional[ToolFollowup] = None
-    
-    # ✅ 统一会话状态（用于任何工具的会话管理）
-    session: Optional[Dict[str, Any]] = None
     
     # 状态同步数据
     sync_data: Dict[str, Any] = {}
@@ -107,22 +104,6 @@ class ToolResultAdapter:
         if not isinstance(message, str):
             message = str(message) if message is not None else ""
         
-        # ✅ 构建统一的会话状态（用于 data["form_session"]）
-        session = None
-        if raw_result.get("session_id"):
-            session = {
-                "session_id": raw_result["session_id"],
-                "form_data": raw_result.get("form_data", {}),
-                "form_stage": raw_result.get("form_stage"),
-                "requires_user_input": raw_result.get("requires_user_input", True),
-                "target_workflow": raw_result.get("target_workflow", ""),
-                "form_complete": raw_result.get("form_complete", False),
-                "owner_tool": "former",  # 标识会话所有者
-                # ✅ 包含前端渲染必需的字段
-                "missing_params": raw_result.get("missing_params", []),
-                "extracted_params": raw_result.get("extracted_params", {})
-            }
-        
         # 提取同步数据
         sync_data = {}
         if "session_id" in raw_result:
@@ -154,7 +135,7 @@ class ToolResultAdapter:
                 }
             ))
         
-        result = ToolResult(
+        return ToolResult(
             tool_name="former",
             status=status,
             message=message,
@@ -164,12 +145,6 @@ class ToolResultAdapter:
             artifacts=artifacts,
             raw_result=raw_result
         )
-        
-        # ✅ 设置会话信息
-        if session:
-            result.session = session
-        
-        return result
     
     @staticmethod
     def adapt_pipeline_result(raw_result: Dict[str, Any]) -> ToolResult:

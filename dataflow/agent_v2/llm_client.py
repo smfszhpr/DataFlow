@@ -4,6 +4,7 @@ LLM客户端，基于现有DataFlow项目的LLM调用方式
 import os
 import json
 import logging
+import asyncio
 from typing import Dict, List, Any, Optional
 
 from dataflow.serving import APILLMServing_request
@@ -63,9 +64,17 @@ class LLMClient:
             logger.error(f"LLM调用失败: {str(e)}")
             return {"content": f"LLM调用失败: {str(e)}"}
     
+    async def acall_llm(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+        """异步调用LLM（当前实现为同步调用的包装）"""
+        # 在asyncio事件循环中运行同步代码，避免阻塞
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self.call_llm, system_prompt, user_prompt
+        )
+    
     async def call_llm_async(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         """异步调用LLM（当前实现为同步调用的包装）"""
-        return self.call_llm(system_prompt, user_prompt)
+        return await self.acall_llm(system_prompt, user_prompt)
     
     def analyze_user_intent(self, user_input: str, available_tools: List[str]) -> Dict[str, Any]:
         """分析用户意图并选择合适的工具"""

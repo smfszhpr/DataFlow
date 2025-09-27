@@ -168,17 +168,18 @@ class FormerTool:
     def params(self) -> type:
         """工具参数模型"""
         return FormerToolParams
-    
-    def execute(self, params: FormerToolParams) -> Dict[str, Any]:
+
+    async def execute(self, **kwargs: Any) -> Dict[str, Any]:
         """执行Former工具
         
         Args:
-            params: 工具参数
+            **kwargs: 工具参数
             
         Returns:
             执行结果
         """
         try:
+            params = FormerToolParams(**kwargs)
             logger.info(f"🔍 Former Tool 执行开始")
             logger.info(f"🔍 参数详情:")
             logger.info(f"  - Action: {params.action}")
@@ -211,7 +212,7 @@ class FormerTool:
                 result = self._submit_form(params, session_id, session_data)
             else:
                 # 所有其他情况（create_form, collect_user_response 等）都用 _create_form
-                result = self._create_form(params, session_id)
+                result = await self._create_form(params, session_id)
             
             logger.info(f"🔍 Former Tool 执行结果概览:")
             logger.info(f"  - Success: {result.get('success', 'unknown')}")
@@ -236,7 +237,7 @@ class FormerTool:
                 "session_id": params.session_id
             }
     
-    def _create_form(self, params: FormerToolParams, session_id: str) -> Dict[str, Any]:
+    async def _create_form(self, params: FormerToolParams, session_id: str) -> Dict[str, Any]:
         """创建表单 - 使用LLM智能分析用户需求并了解工作流参数"""
         try:
             logger.info(f"🔍 _create_form 开始 - Session: {session_id}")
@@ -265,7 +266,7 @@ class FormerTool:
             
             # 🎯 使用LLM进行需求分析和工作流匹配
             logger.info(f"🔍 开始LLM分析和工作流匹配")
-            analysis_result = self._llm_analyze_and_match_workflow(user_prompt)
+            analysis_result = await self._llm_analyze_and_match_workflow(user_prompt)
             logger.info(f"🔍 LLM分析结果: {analysis_result}")
             
             if not analysis_result.get("success"):
@@ -351,7 +352,10 @@ class FormerTool:
                 "form_data": form_data,  # 统一的表单数据结构
                 "requires_user_input": decision != "ready_to_execute",
                 "form_complete": decision == "ready_to_execute",
-                "routing_reason": f"需求分析决策: {decision}"
+                "routing_reason": f"需求分析决策: {decision}",
+                # ✅ 添加前端渲染必需的字段
+                "missing_params": missing_params,
+                "extracted_params": extracted_params
             }
             
         except Exception as e:
@@ -495,7 +499,7 @@ class FormerTool:
                 lines.append(f"- **{key}**: {value}")
         return "\n".join(lines) if lines else "无特殊参数"
     
-    def _llm_analyze_and_match_workflow(self, user_input: str) -> Dict[str, Any]:
+    async def _llm_analyze_and_match_workflow(self, user_input: str) -> Dict[str, Any]:
         """使用LLM深度分析用户需求并智能匹配工作流"""
         try:
             # 🎯 构建真实的工作流参数信息
@@ -575,7 +579,7 @@ class FormerTool:
 5. 评估信息的完整性"""
             
             # 调用LLM进行深度分析
-            response = self.llm.call_llm(system_prompt, user_prompt)
+            response = await self.llm.acall_llm(system_prompt, user_prompt)
             content = response.get('content', '').strip()
             
             if not content:
