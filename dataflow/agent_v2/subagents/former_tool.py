@@ -30,110 +30,13 @@ class FormerTool:
     
     def __init__(self):
         self.llm = get_llm_client()
-        # 动态获取真实的工作流参数定义
-        self.workflow_registry = self._discover_available_workflows()
+        # 使用统一的工作流注册表
+        from dataflow.agent_v2.master.tools import WorkflowRegistry
+        self.workflow_registry_manager = WorkflowRegistry()
+        self.workflow_registry = self.workflow_registry_manager.get_all_workflows()
+
     
-    def _discover_available_workflows(self) -> Dict[str, Dict[str, Any]]:
-        """动态发现可用工作流及其真实参数定义"""
-        workflows = {}
-        
-        try:
-            # 🎯 真正从代码工作流工具中获取参数定义
-            from dataflow.agent_v2.subagents.code_workflow_tool import CodeWorkflowToolParams
-            from dataflow.agent_v2.subagents.pipeline_workflow_tool import PipelineWorkflowToolParams
-            
-            # 通过反射获取真实的参数定义
-            code_workflow_params = self._extract_params_from_pydantic_model(CodeWorkflowToolParams)
-            pipeline_workflow_params = self._extract_params_from_pydantic_model(PipelineWorkflowToolParams)
-            
-            workflows["code_workflow_agent"] = {
-                "description": "代码生成、测试、调试循环工具",
-                "params_schema": code_workflow_params,
-                "tool_class": "CodeWorkflowTool"
-            }
-            
-            workflows["pipeline_workflow_agent"] = {
-                "description": "数据处理流水线推荐工具",
-                "params_schema": pipeline_workflow_params,
-                "tool_class": "PipelineWorkflowTool"
-            }
-            
-            # 可以添加其他工作流的动态发现
-            logger.info(f"发现 {len(workflows)} 个工作流")
-            
-        except Exception as e:
-            logger.error(f"工作流发现失败: {e}")
-            # 回退到基础定义
-            workflows["code_workflow_agent"] = {
-                "description": "代码生成工具",
-                "params_schema": {
-                    "requirement": {"required": True, "type": "str", "description": "用户代码需求"}
-                },
-                "tool_class": "CodeWorkflowTool"
-            }
-            workflows["pipeline_workflow_agent"] = {
-                "description": "数据处理流水线推荐工具",
-                "params_schema": {
-                    "json_file": {"required": True, "type": "str", "description": "数据文件路径"},
-                    "target": {"required": True, "type": "str", "description": "用户需求目标"},
-                    "python_file_path": {"required": True, "type": "str", "description": "输出脚本路径"}
-                },
-                "tool_class": "PipelineWorkflowTool"
-            }
-        
-        return workflows
-    
-    def _extract_params_from_pydantic_model(self, model_class) -> Dict[str, Any]:
-        """从Pydantic模型中提取参数定义"""
-        params_schema = {}
-        
-        try:
-            # 兼容不同版本的Pydantic
-            if hasattr(model_class, '__fields__'):
-                # Pydantic v1
-                for field_name, field_info in model_class.__fields__.items():
-                    param_def = {
-                        "type": str(getattr(field_info, 'type_', field_info.annotation if hasattr(field_info, 'annotation') else 'Any')),
-                        "required": getattr(field_info, 'required', True),
-                        "description": getattr(field_info.field_info, 'description', f"{field_name}参数") if hasattr(field_info, 'field_info') else f"{field_name}参数"
-                    }
-                    
-                    # 获取默认值
-                    default_val = getattr(field_info, 'default', None)
-                    if default_val is not None and default_val != ...:
-                        param_def["default"] = default_val
-                    
-                    params_schema[field_name] = param_def
-                    
-            elif hasattr(model_class, 'model_fields'):
-                # Pydantic v2
-                for field_name, field_info in model_class.model_fields.items():
-                    param_def = {
-                        "type": str(field_info.annotation if hasattr(field_info, 'annotation') else 'Any'),
-                        "required": getattr(field_info, 'is_required', lambda: True)() if callable(getattr(field_info, 'is_required', True)) else True,
-                        "description": getattr(field_info, 'description', f"{field_name}参数")
-                    }
-                    
-                    # 获取默认值
-                    if hasattr(field_info, 'default') and field_info.default is not None:
-                        param_def["default"] = field_info.default
-                    
-                    params_schema[field_name] = param_def
-                    
-            logger.debug(f"提取参数模式: {params_schema}")
-            
-        except Exception as e:
-            logger.error(f"参数模式提取失败: {e}")
-            # 提供备用方案
-            if hasattr(model_class, '__annotations__'):
-                for field_name, field_type in model_class.__annotations__.items():
-                    params_schema[field_name] = {
-                        "type": str(field_type),
-                        "required": True,
-                        "description": f"{field_name}参数"
-                    }
-        
-        return params_schema
+
     
     @classmethod
     def name(cls) -> str:

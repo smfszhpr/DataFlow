@@ -30,32 +30,13 @@ from myscalekb_agent_base.graph_builder import GraphBuilder, node, edge, conditi
 from myscalekb_agent_base.schemas.agent_metadata import AgentMetadata
 
 # 保留自己的组件
-from dataflow.agent_v2.base.core import BaseTool
-
 # 导入事件系统
 from ..events.core import EventSink, Event, EventType
 
 from dataflow.agent_v2.llm_client import get_llm_client
-from dataflow.agent_v2.subagents.apikey_agent import APIKeyTool
-from dataflow.agent_v2.subagents.mock_tools import SleepTool
-from dataflow.agent_v2.subagents.csvtools import CSVProfileTool, CSVDetectTimeColumnsTool, CSVVegaSpecTool, ASTStaticCheckTool, UnitTestStubTool, LocalIndexBuildTool, LocalIndexQueryTool
-from dataflow.agent_v2.subagents.former_tool import FormerTool
-from dataflow.agent_v2.subagents.code_workflow_tool import CodeWorkflowTool
-from dataflow.agent_v2.subagents.pipeline_workflow_tool import PipelineWorkflowTool
+from .tools import ToolsMixin
 
 from concurrent.futures import ThreadPoolExecutor
-
-def to_langchain_tool(tool: BaseTool) -> StructuredTool:
-    """将自定义工具对象转换为LangChain的StructuredTool"""
-    ArgsSchema = tool.params()
-
-    return StructuredTool.from_function(
-        coroutine=tool.execute,  # 直接使用工具的异步execute方法
-        name=tool.name(),
-        description=tool.description(),
-        args_schema=ArgsSchema,
-        return_direct=False,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +78,7 @@ class AgentState(TypedDict, total=False):
     next_action: Optional[str]  # 下一个动作决策
 
 
-class MasterAgent(SubAgent):
+class MasterAgent(ToolsMixin, SubAgent):
     """DataFlow Master Agent - 基于 MyScaleKB-Agent 风格的 LangGraph 架构"""
     
     def __init__(self, ctx=None, llm=None, memory=None, *args, **kwargs):
@@ -111,8 +92,11 @@ class MasterAgent(SubAgent):
         # 确保self.llm在super().__init__之前被设置
         self.llm = llm
         
+        # 先初始化 ToolsMixin
+        ToolsMixin.__init__(self)
+        
         try:
-            super().__init__(ctx, llm, memory, *args, **kwargs)
+            SubAgent.__init__(self, ctx, llm, memory, *args, **kwargs)
         except Exception as e:
             logger.error(f"❌ SubAgent初始化失败: {e}")
             # 如果SubAgent初始化失败，我们手动设置必要的属性
@@ -122,10 +106,6 @@ class MasterAgent(SubAgent):
         self.forward_paths = {}
         self.sub_agents = {}
         self.conversation_sessions = {}  # 会话管理
-        self.tools = []
-
-        # 注册工具
-        self._register_tools()
     
     @classmethod
     def name(cls) -> str:
@@ -135,39 +115,7 @@ class MasterAgent(SubAgent):
     def description(cls) -> str:
         return "DataFlow主控智能体，支持多轮编排和工具调用，可以处理复杂的用户请求"
     
-    def _register_tools(self):
-        """注册工具"""
-        try:
-            self.tools = [
-                APIKeyTool(),
-                FormerTool(),
-                CodeWorkflowTool(),
-                PipelineWorkflowTool(),
-                SleepTool(),
-                CSVProfileTool(), 
-                CSVDetectTimeColumnsTool(), 
-                CSVVegaSpecTool(), 
-                ASTStaticCheckTool(), 
-                UnitTestStubTool(), 
-                LocalIndexBuildTool(), 
-                LocalIndexQueryTool()
-            ]
-            
-            logger.info(f"已注册 {len(self.tools)} 个可直接调用的工具")
-            
-        except Exception as e:
-            logger.error(f"工具注册失败: {e}")
-            self.tools = []
-        
-        # 确保 lc_tools 总是被设置
-        self.lc_tools = [to_langchain_tool(t) for t in (self.tools or [])]
-        
-        # 初始化工具执行器
-        try:
-            self.tool_executor = ToolExecutor(self.lc_tools)
-        except Exception as e:
-            logger.error(f"ToolExecutor初始化失败: {e}")
-            self.tool_executor = None
+
 
     def build_app(self):
         """构建代理工作流 - 类似 MyScaleKB-Agent 的实现"""
