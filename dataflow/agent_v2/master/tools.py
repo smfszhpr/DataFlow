@@ -41,47 +41,38 @@ class WorkflowRegistry:
         self.workflows = self._discover_available_workflows()
     
     def _discover_available_workflows(self) -> Dict[str, Dict[str, Any]]:
-        """动态发现可用工作流及其真实参数定义"""
+        """自动发现工作流工具并提取配置信息"""
         workflows = {}
         
-        try:
-            # 通过反射获取真实的参数定义
-            code_workflow_params = self._extract_params_from_pydantic_model(CodeWorkflowToolParams)
-            pipeline_workflow_params = self._extract_params_from_pydantic_model(PipelineWorkflowToolParams)
-            
-            workflows["code_workflow_agent"] = {
-                "description": "代码生成、测试、调试循环工具",
-                "params_schema": code_workflow_params,
-                "tool_class": "CodeWorkflowTool"
-            }
-            
-            workflows["pipeline_workflow_agent"] = {
-                "description": "数据处理流水线推荐工具", 
-                "params_schema": pipeline_workflow_params,
-                "tool_class": "PipelineWorkflowTool"
-            }
-            
-            logger.info(f"发现 {len(workflows)} 个工作流")
-            
-        except Exception as e:
-            logger.error(f"工作流发现失败: {e}")
-            # 回退到基础定义
-            workflows["code_workflow_agent"] = {
-                "description": "代码生成工具",
-                "params_schema": {
-                    "requirement": {"required": True, "type": "str", "description": "用户代码需求"}
-                },
-                "tool_class": "CodeWorkflowTool"
-            }
-            workflows["pipeline_workflow_agent"] = {
-                "description": "数据处理流水线推荐工具",
-                "params_schema": {
-                    "json_file": {"required": True, "type": "str", "description": "数据文件路径"},
-                    "target": {"required": True, "type": "str", "description": "处理目标"}
-                },
-                "tool_class": "PipelineWorkflowTool"
-            }
+        # 定义工作流工具类 - 添加新工作流只需在这里添加
+        workflow_tool_classes = [
+            CodeWorkflowTool,
+            PipelineWorkflowTool,
+            # 将来添加新工作流工具时在这里添加即可
+        ]
         
+        for tool_class in workflow_tool_classes:
+            try:
+                # 从工具类提取基本信息
+                tool_name = tool_class.name()
+                tool_description = tool_class.description()
+                params_model = tool_class.params()
+                
+                # 从 Pydantic 模型提取参数配置
+                params_schema = self._extract_params_from_pydantic_model(params_model)
+                
+                workflows[tool_name] = {
+                    "description": tool_description,
+                    "params_schema": params_schema,
+                    "tool_class": tool_class.__name__
+                }
+                
+                logger.debug(f"✅ 成功注册工作流: {tool_name}")
+                
+            except Exception as e:
+                logger.error(f"❌ 注册工作流失败 {tool_class.__name__}: {e}")
+                
+        logger.info(f"🎯 发现 {len(workflows)} 个工作流")
         return workflows
     
     def _extract_params_from_pydantic_model(self, model_class) -> Dict[str, Any]:
